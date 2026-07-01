@@ -21,7 +21,7 @@ import random
 
 from test.pylib.runner import testpy_test_fixture_scope
 from test.pylib.suite.python import PythonTest, add_host_option, add_cql_connection_options, add_s3_options
-from .util import unique_name, new_test_keyspace, keyspace_has_tablets, cql_session, local_process_id, is_scylla, config_value_context
+from .util import unique_name, new_test_keyspace, keyspace_has_tablets, cql_session, cql_session_new_driver, local_process_id, is_scylla, config_value_context
 from .nodetool import scylla_log
 
 print(f"Driver name {DRIVER_NAME}, version {DRIVER_VERSION}")
@@ -52,9 +52,13 @@ async def host(request, testpy_test: PythonTest | None):
 @pytest.fixture(scope=testpy_test_fixture_scope)
 def cql(request, host):
     port = request.config.getoption("--port")
+    use_old_driver = request.config.getoption("--use-old-driver")
+
+    session_factory = cql_session if use_old_driver else cql_session_new_driver
+
     try:
         # Use the default superuser credentials, which work for both Scylla and Cassandra
-        with cql_session(
+        with session_factory(
                 host=host,
                 port=port,
                 is_ssl=request.config.getoption("--ssl"),
@@ -78,7 +82,7 @@ def cql_test_connection(cql, request):
         pytest.skip('Server down')
     yield
     try:
-        # We want to run a do-nothing CQL command. 
+        # We want to run a do-nothing CQL command.
         # "BEGIN BATCH APPLY BATCH" is the closest to do-nothing I could find...
         cql.execute("BEGIN BATCH APPLY BATCH")
     except:
