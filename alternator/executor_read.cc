@@ -40,6 +40,7 @@
 #include "utils/overloaded_functor.hh"
 #include "utils/error_injection.hh"
 #include "vector_search/vector_store_client.hh"
+#include <cstdint>
 #include <seastar/core/abort_on_expiry.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -578,10 +579,10 @@ static rjson::value encode_paging_state(const schema& schema, const service::pag
     }
     auto pos = paging_state.get_position_in_partition();
     if (pos.has_key()) {
-        // Alternator itself allows at most one column in clustering key, but 
+        // Alternator itself allows at most one column in clustering key, but
         // user can use Alternator api to access system tables which might have
         // multiple clustering key columns. So we need to handle that case here.
-        auto cdef_it = schema.clustering_key_columns().begin();        
+        auto cdef_it = schema.clustering_key_columns().begin();
         for(const auto &exploded_ck : pos.key().explode()) {
             rjson::add_with_string_name(last_evaluated_key, std::string_view(cdef_it->name_as_text()), rjson::empty_object());
             rjson::value& key_entry = last_evaluated_key[cdef_it->name_as_text()];
@@ -1059,9 +1060,12 @@ calculate_bounds_condition_expression(schema_ptr schema,
     std::vector<const parsed::primitive_condition*> conditions;
     condition_expression_and_list(p, conditions);
 
-    if (conditions.size() < 1 || conditions.size() > 2) {
+    uint32_t pk_size = schema->partition_key_size();
+    uint32_t ck_size = schema->clustering_key_size();
+
+    if (conditions.size() < 1 || conditions.size() > pk_size + ck_size) {
         throw api_error::validation(
-                "KeyConditionExpression syntax error: must have 1 or 2 conditions");
+                fmt::format("KeyConditionExpression syntax error: must have between 1 and {} conditions", (pk_size + ck_size)));
     }
     // Scylla allows us to have an (equality) constraint on the partition key
     // pk_cdef, and a range constraint on the *first* clustering key ck_cdef.
