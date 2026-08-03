@@ -36,7 +36,7 @@
 #include "gms/feature_service.hh"
 #include "mutation/mutation.hh"
 #include "types/types.hh"
-#include "types/map.hh"
+#include "types/listlike_partial_deserializing_iterator.hh"
 #include "utils/assert.hh"
 #include "utils/rjson.hh"
 #include "utils/big_decimal.hh"
@@ -123,7 +123,7 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
 future<executor::request_return_type> executor::describe_time_to_live(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
     _stats.api_operations.describe_time_to_live++;
     schema_ptr schema = get_table(_proxy, request);
-    
+
     maybe_audit(audit_info, audit::statement_category::QUERY,
                 schema->ks_name(), schema->cf_name(), "DescribeTimeToLive", request);
 
@@ -240,6 +240,26 @@ static bool is_expired(const rjson::value& expiration_time, gc_clock::time_point
     return n && is_expired(*n, now);
 }
 
+// Cells in the map are sorted by key order. Use that fact to find the key value
+// pair without materializing the whole :attrs map.
+static std::optional<managed_bytes_view> zero_copy_find_value_bytes_in_map(managed_bytes_view map, bytes_view key) {
+    const single_fragmented_view member_view{key};
+    int size = read_collection_size(map);
+    while (size--) {
+        managed_bytes_view key = read_collection_key(map);
+        managed_bytes_view value = read_collection_value_nonnull(map);
+        const std::strong_ordering cmp = compare_unsigned(key, member_view);
+        if (cmp == 0) {
+            return value;
+        }
+        if (cmp > 0) {
+            // Keys are sorted, so we're already past where it would have been.
+            break;
+        }
+    }
+    return std::nullopt;
+}
+
 // expire_item() expires an item - i.e., deletes it as appropriate for
 // expiration - with CL=QUORUM and (FIXME!) in a way Alternator Streams
 // understands it is an expiration event - not a user-initiated deletion.
@@ -266,7 +286,7 @@ static future<> expire_item(service::storage_proxy& proxy,
         }
         exploded_pk.push_back(to_bytes(*row_c));
     }
-    auto pk = partition_key::from_exploded(exploded_pk);
+    auto pk = partition_key::from_exploded(std::move(exploded_pk));
     mutation m(schema, pk);
     // If there's no clustering key, a tombstone should be created directly
     // on a partition, not on a clustering row - otherwise it will look like
@@ -286,7 +306,7 @@ static future<> expire_item(service::storage_proxy& proxy,
             }
             exploded_ck.push_back(to_bytes(*row_c));
         }
-        auto ck = clustering_key::from_exploded(exploded_ck);
+        auto ck = clustering_key::from_exploded(std::move(exploded_ck));
         m.partition().clustered_row(*schema, ck).apply(tombstone(ts, gc_clock::now()));
     }
     utils::chunked_vector<mutation> mutations;
@@ -506,7 +526,7 @@ public:
 struct scan_ranges_context {
     schema_ptr s;
     bytes column_name;
-    std::optional<std::string> member;
+    std::optional<bytes> member;
 
     service::client_state internal_client_state;
     ::shared_ptr<cql3::selection::selection> selection;
@@ -514,7 +534,7 @@ struct scan_ranges_context {
     std::unique_ptr<cql3::query_options> query_options;
     ::lw_shared_ptr<query::read_command> command;
 
-    scan_ranges_context(schema_ptr s, service::storage_proxy& proxy, bytes column_name, std::optional<std::string> member)
+    scan_ranges_context(schema_ptr s, service::storage_proxy& proxy, bytes column_name, std::optional<bytes> member)
         : s(s)
         , column_name(column_name)
         , member(member)
@@ -612,33 +632,28 @@ static future<> scan_table_ranges(
         if (!expiration_column) {
             continue;
         }
+        const auto now = gc_clock::now();
         for (const auto& row : rows) {
             const managed_bytes_opt& cell = row[*expiration_column];
             if (!cell) {
                 continue;
             }
-            auto v = meta[*expiration_column]->type->deserialize(*cell);
+
             bool expired = false;
-            // FIXME: don't recalculate "now" all the time
-            auto now = gc_clock::now();
             if (scan_ctx.member) {
                 // In this case, the expiration-time attribute we're
                 // looking for is a member in a map, saved serialized
                 // into bytes using Alternator's serialization (basically
                 // a JSON serialized into bytes)
-                // FIXME: is it possible to find a specific member of a map
-                // without iterating through it like we do here and compare
-                // the key?
-                for (const auto& entry : value_cast<map_type_impl::native_type>(v)) {
-                    std::string attr_name = value_cast<sstring>(entry.first);
-                    if (value_cast<sstring>(entry.first) == *scan_ctx.member) {
-                        bytes value = value_cast<bytes>(entry.second);
-                        rjson::value json = deserialize_item(value);
-                        expired = is_expired(json, now);
-                        break;
-                    }
+                std::optional<managed_bytes_view> value =
+                    zero_copy_find_value_bytes_in_map(managed_bytes_view(*cell), *scan_ctx.member);
+                if (value) {
+                    expired = value->with_linearized([now] (bytes_view bv) {
+                        return is_expired(deserialize_item(bv), now);
+                    });
                 }
             } else {
+                auto v = meta[*expiration_column]->type->deserialize(*cell);
                 // For a real column to contain an expiration time, it
                 // must be a numeric type. We currently support decimal
                 // (used by Alternator TTL) as well as bigint, int and
@@ -730,12 +745,12 @@ static future<bool> scan_table(
     // (counting milliseconds).
     bytes column_name = to_bytes(*attribute_name);
     const column_definition *cd = s->get_column_definition(column_name);
-    std::optional<std::string> member;
+    std::optional<bytes> member;
     if (!cd) {
-        member = std::move(attribute_name);
+        member = std::move(column_name);
         column_name = bytes(executor::ATTRS_COLUMN_NAME);
         cd = s->get_column_definition(column_name);
-        tlogger.info("table {} TTL enabled with attribute {} in {}", s->cf_name(), *member, executor::ATTRS_COLUMN_NAME);
+        tlogger.info("table {} TTL enabled with attribute {} in {}", s->cf_name(), *attribute_name, executor::ATTRS_COLUMN_NAME);
     } else {
         tlogger.info("table {} TTL enabled with attribute {}", s->cf_name(), *attribute_name);
     }
