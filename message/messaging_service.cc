@@ -514,10 +514,26 @@ messaging_service::messaging_service(config cfg, scheduling_config scfg, std::sh
     // this initialization should be done before any handler registration
     // this is because register_handler calls to: scheduling_group_for_verb
     // which in turn relies on _connection_index_for_tenant to be initialized.
-    _connection_index_for_tenant.reserve(_scheduling_config.statement_tenants.size());
+    _connection_index_for_tenant.reserve(_scheduling_config.statement_tenants.size() + _scheduling_config.tenant_views.size());
     for (unsigned i = 0; i <  _scheduling_config.statement_tenants.size(); ++i) {
         auto& tenant_cfg = _scheduling_config.statement_tenants[i];
         _connection_index_for_tenant.push_back({tenant_cfg.sched_group, i, tenant_cfg.enabled});
+    }
+
+    for (const auto& tenant_view: _scheduling_config.tenant_views) {
+        auto tenant_it = std::find_if(
+            _scheduling_config.statement_tenants.begin(),
+            _scheduling_config.statement_tenants.end(),
+            [tenant_view] (const auto& tenant) {
+                return tenant_view.name == tenant.name;
+            }
+        );
+        if (tenant_it == _scheduling_config.statement_tenants.end()) {
+            throw std::runtime_error("Tenant view must reffer to an existing tenant");
+        }
+        unsigned tenant_reused_conn_idx = std::distance(_scheduling_config.statement_tenants.begin(), tenant_it);
+
+        _connection_index_for_tenant.push_back({tenant_view.sched_group, tenant_reused_conn_idx, tenant_it->enabled});
     }
 
     register_handler(this, messaging_verb::CLIENT_ID, [this] (rpc::client_info& ci, gms::inet_address broadcast_address, uint32_t src_cpu_id, rpc::optional<uint64_t> max_result_size, rpc::optional<utils::UUID> host_id,
@@ -843,12 +859,12 @@ messaging_service::get_rpc_client_idx(messaging_verb verb) {
         return idx;
     }
     const auto curr_sched_group = current_scheduling_group();
-    for (unsigned i = 0; i < _connection_index_for_tenant.size(); ++i) {
-        if (_connection_index_for_tenant[i].sched_group == curr_sched_group) {
-            if (_connection_index_for_tenant[i].enabled) {
+    for (const auto& conn_idx : _connection_index_for_tenant) {
+        if (conn_idx.sched_group == curr_sched_group) {
+            if (conn_idx.enabled) {
                 // i == 0: the default tenant maps to the default client indexes belonging to the interval
                 // [PER_SHARD_CONNECTION_COUNT, PER_SHARD_CONNECTION_COUNT + PER_TENANT_CONNECTION_COUNT).
-                idx += i * PER_TENANT_CONNECTION_COUNT;
+                idx += conn_idx.cliend_idx * PER_TENANT_CONNECTION_COUNT;
                 return idx;
             } else {
                 // If the tenant is disable, immediately return current index to
@@ -856,7 +872,6 @@ messaging_service::get_rpc_client_idx(messaging_verb verb) {
                 return idx;
             }
         }
-
     }
 
     // if we got here - it means that two conditions are met:
@@ -1070,6 +1085,12 @@ void messaging_service::enable_scheduling_tenant(std::string_view name) {
         if (_scheduling_config.statement_tenants[i].name == name) {
             _scheduling_config.statement_tenants[i].enabled = true;
             _connection_index_for_tenant[i].enabled = true;
+            break;
+        }
+    }
+    for (size_t i = 0; i < _scheduling_config.tenant_views.size(); ++i) {
+        if (_scheduling_config.tenant_views[i].name == name) {
+            _connection_index_for_tenant[_scheduling_config.statement_tenants.size() + i].enabled = true;
             return;
         }
     }

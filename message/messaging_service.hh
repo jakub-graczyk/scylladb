@@ -324,13 +324,23 @@ public:
             sstring name;
             bool enabled = true;
         };
-        // Must have at least one element. No two tenants should have the same
-        // scheduling group. [0] is the default tenant, that all unknown
-        // scheduling groups will fall back to. The default tenant should use
-        // the statement scheduling group, for backward compatibility. In fact
-        // any other scheduling group would be dropped as the default tenant,
-        // does not transfer its scheduling group across the wire.
+        struct tenant_view {
+            scheduling_group sched_group;
+            sstring name;
+        };
+        // Must have at least one element. No two tenants nor tenant_views
+        // should have the same scheduling group. [0] is the default tenant,
+        // that all unknown scheduling groups will fall back to. The default
+        // tenant should use the statement scheduling group, for backward
+        // compatibility. In fact any other scheduling group would be dropped
+        // as the default tenant, does not transfer its scheduling group across
+        // the wire.
         std::vector<tenant> statement_tenants;
+        // This allows for reusing the existing tenant (and crucially it's
+        // connections) for a given scheduling group. Must have a corresponding
+        // tenant in statement_tenants above. Scheduling group must be unique
+        // across all tenants and tenant_views.
+        std::vector<tenant_view> tenant_views;
         scheduling_group streaming;
         scheduling_group gossip;
     };
