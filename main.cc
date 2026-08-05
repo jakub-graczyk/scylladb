@@ -1138,7 +1138,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             }).get();
             // storage_proxy holds a reference on it and is not yet stopped.
             // what's worse is that the calltrace
-            //   storage_proxy::do_query 
+            //   storage_proxy::do_query
             //                ::query_partition_key_range
             //                ::query_partition_key_range_concurrent
             // leaves unwaited futures on the reactor and once it gets there
@@ -1236,6 +1236,13 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             dbcfg.schema_commitlog_scheduling_group = create_scheduling_group("schema_commitlog", "sclg", 1000).get();
             dbcfg.backup_scheduling_group = create_scheduling_group("backup", "bckp", 200, maintenance_supergroup).get(),
             dbcfg.available_memory = memory::stats().total_memory();
+
+            bool alternator_ttl_scheduling_group_set = false;
+            auto alternator_ttl_scheduling_group = dbcfg.streaming_scheduling_group;
+            if (cfg->alternator_port() || cfg->alternator_https_port()) {
+                alternator_ttl_scheduling_group = create_scheduling_group("alternator_ttl", "attl", 200, maintenance_supergroup).get();
+                alternator_ttl_scheduling_group_set = true;
+            }
 
             // Make sure to initialize the scheduling group keys at a point where we are sure
             // that nobody will be creating scheduling groups (e.g. service levels controller can do that).
@@ -1687,12 +1694,18 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             };
             scfg.streaming = dbcfg.streaming_scheduling_group;
             scfg.gossip = dbcfg.gossip_scheduling_group;
+            scfg.tenant_views = {};
+            if (alternator_ttl_scheduling_group_set) {
+                scfg.tenant_views = {
+                    {alternator_ttl_scheduling_group, "$maintenance"}
+                };
+            }
 
             checkpoint(stop_signal, "starting messaging service");
             debug::the_messaging_service = &messaging;
 
             std::shared_ptr<seastar::tls::credentials_builder> creds;
-            if (mscfg.encrypt != netw::messaging_service::encrypt_what::none 
+            if (mscfg.encrypt != netw::messaging_service::encrypt_what::none
                 || (cfg->ssl_storage_port() != 0 && seo.contains("certificate"))
             ) {
                 creds = std::make_shared<seastar::tls::credentials_builder>();
@@ -1996,7 +2009,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             checkpoint(stop_signal, "initializing strongly consistent groups manager");
             sharded<service::strong_consistency::groups_manager> groups_manager;
-            groups_manager.start(std::ref(messaging), std::ref(raft_gr), std::ref(qp), 
+            groups_manager.start(std::ref(messaging), std::ref(raft_gr), std::ref(qp),
                 std::ref(db), std::ref(mm), std::ref(sys_ks), std::ref(feature_service), std::ref(gossiper),
                 std::ref(raft_replay_buffer)).get();
             auto stop_groups_manager = defer_verbose_shutdown("strongly consistent groups manager", [&] {
@@ -2198,7 +2211,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 }
             }
 
-            // Once stuff is replayed, we can empty RP:s from truncation records. 
+            // Once stuff is replayed, we can empty RP:s from truncation records.
             // This ensures we can't mis-mash older records with a newer crashed run.
             // I.e: never keep replay_positions alive across a restart cycle.
             sys_ks.local().drop_truncation_rp_records().get();
@@ -2736,7 +2749,12 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             stop_expiration_service = defer_verbose_shutdown("expiration service", [&es] {
                 es.stop().get();
             });
-            with_scheduling_group(dbcfg.streaming_scheduling_group, [&es] {
+            // This will use the Alternator scheduling group when alternator is
+            // enabled (i.e. the Alternator port is configured). This will have
+            // a side effect when used alongside CQL per-row TTL feature:
+            // The CQL per-row TTL will be treated as Alternator TTL, and will
+            // be throttled the same way.
+            with_scheduling_group(alternator_ttl_scheduling_group, [&es] {
                 return es.invoke_on_all(&alternator::expiration_service::start);
             }).get();
 
