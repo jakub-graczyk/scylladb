@@ -522,6 +522,46 @@ public:
     }
 };
 
+class ttl_scan_pacer {
+    using sec_duration = std::chrono::duration<double>;
+
+    static sec_duration now() {
+        return std::chrono::duration_cast<sec_duration>(lowres_clock::now().time_since_epoch());
+    }
+
+    sec_duration _scan_started;
+    sec_duration _target;
+    uint64_t _work_to_do;
+    uint64_t _work_done = 0;
+public:
+    ttl_scan_pacer(double time_target, uint64_t work_to_do)
+        : _scan_started(now())
+        , _target(sec_duration{time_target})
+        , _work_to_do(work_to_do)
+    {
+    }
+
+    std::optional<lowres_clock::duration> should_sleep() {
+        if (!_work_to_do) {
+            return std::nullopt;
+        }
+        ++_work_done;
+        if (_work_done <= _work_to_do) {
+            return std::nullopt;
+        }
+        sec_duration elapsed = now() - _scan_started;
+        if (elapsed >= _target) {
+            return std::nullopt;
+        }
+        double should_done = static_cast<double>(_work_to_do) * (elapsed / _target);
+        if (should_done >= static_cast<double>(_work_done)) {
+            return std::nullopt;
+        }
+        sec_duration should_sleep = static_cast<double>(_work_done) * _target / _work_to_do - elapsed;
+        return std::chrono::duration_cast<lowres_clock::duration>(should_sleep);
+    }
+};
+
 // Precomputed information needed to perform a scan on partition ranges
 struct scan_ranges_context {
     schema_ptr s;
@@ -827,9 +867,25 @@ static future<bool> scan_table(
               // which would otherwise be held up by us keeping the ERM.
               // tablet_guard blocks only the selected tablet.
 
+            // Register a callback on abort_source to signal also tablet_guard's
+            // abort source. This allows for scan_table_ranges to finish quickly
+            // when the erm is stale aborting the scan mid parittion range.
+            auto& tg_as = tablet_guard->get_abort_source();
+            auto sub = abort_source.subscribe([&tg_as] () noexcept {tg_as.request_abort();});
+            if (abort_source.abort_requested()) {
+                // This can happen when scan was aborted before callback was
+                // registered
+                co_return true;
+            }
             // Note that because of issue #9167 we need to run a separate query on each partition range, and can't pass
             // several of them into one partition_range_vector that is passed to scan_table_ranges().
-            co_await scan_table_ranges(proxy, scan_ctx, {std::move(*range)}, abort_source, page_sem, expiration_stats);
+            co_await scan_table_ranges(proxy, scan_ctx, {std::move(*range)}, tg_as, page_sem, expiration_stats);
+            if (abort_source.abort_requested()) {
+                // Return when scan was aborted, *not* when tablet_guard
+                // aborted scan_table_ranges due to this tablet being affected.
+                co_return true;
+            }
+            sub = {}; // sub had reference to tablet_guard which is about to be reset
             tablet_guard.reset();
         } while (*last_token < dht::last_token());
     } else {  // VNodes
