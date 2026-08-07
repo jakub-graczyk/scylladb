@@ -60,6 +60,14 @@ static logging::logger tlogger("alternator_ttl");
 
 namespace alternator {
 
+static bool this_shard_scans_tablet(
+    const locator::tablet_map& tablet_map,
+    const locator::tablet_id& tablet,
+    const locator::effective_replication_map_ptr& erm,
+    const gms::gossiper& gossiper,
+    const locator::host_id& my_host_id
+);
+
 future<executor::request_return_type> executor::update_time_to_live(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
     _stats.api_operations.update_time_to_live++;
     if (!_proxy.features().alternator_ttl) {
@@ -546,18 +554,17 @@ public:
             return std::nullopt;
         }
         ++_work_done;
-        if (_work_done <= _work_to_do) {
+        if (_work_done >= _work_to_do) {
             return std::nullopt;
         }
         sec_duration elapsed = now() - _scan_started;
         if (elapsed >= _target) {
             return std::nullopt;
         }
-        double should_done = static_cast<double>(_work_to_do) * (elapsed / _target);
-        if (should_done >= static_cast<double>(_work_done)) {
+        sec_duration should_sleep = static_cast<double>(_work_done) * _target / _work_to_do - elapsed;
+        if (should_sleep <= sec_duration::zero()) {
             return std::nullopt;
         }
-        sec_duration should_sleep = static_cast<double>(_work_done) * _target / _work_to_do - elapsed;
         return std::chrono::duration_cast<lowres_clock::duration>(should_sleep);
     }
 };
@@ -766,6 +773,7 @@ static future<bool> scan_table(
     gms::gossiper& gossiper,
     schema_ptr s,
     abort_source& abort_source,
+    ttl_scan_pacer& pacer,
     named_semaphore& page_sem,
     expiration_service::stats& expiration_stats)
 {
@@ -830,25 +838,10 @@ static future<bool> scan_table(
                 // The loop finds the tablet range to scan, one which we are the primary replica for,
                 // or if the primary replica is down, one which we are the secondary replica for.
                 do {
-                    auto tablet_token_range = tablet_map.get_token_range(*tablet);
                     last_token = tablet_map.get_last_token(*tablet);
-                    auto tablet_primary_replica = tablet_map.get_primary_replica(*tablet, erm->get_topology());
-                    if (tablet_primary_replica.host == my_host_id && tablet_primary_replica.shard == this_shard_id()) {
+                    if (this_shard_scans_tablet(tablet_map, *tablet, erm, gossiper, my_host_id)) {
+                        auto tablet_token_range = tablet_map.get_token_range(*tablet);
                         range = dht::to_partition_range(std::move(tablet_token_range));
-                    } else if (erm->get_replication_factor() > 1) {
-                        // If each node only scans its own primary ranges, then when any node is
-                        // down part of the token range will not get scanned. This can be viewed
-                        // as acceptable (when it comes back online, it will resume its scan),
-                        // but as noted in issue #9787, we can allow more prompt expiration
-                        // by tasking another node to take over scanning of the dead node's primary
-                        // ranges. What we do here is that this node will also check expiration
-                        // on its *secondary* ranges - but only those whose primary owner is down.
-                        auto tablet_secondary_replica = tablet_map.get_secondary_replica(*tablet, erm->get_topology()); // throws if no secondary replica
-                        if (tablet_secondary_replica.host == my_host_id && tablet_secondary_replica.shard == this_shard_id()) {
-                            if (!gossiper.is_alive(tablet_primary_replica.host)) {
-                                range = dht::to_partition_range(std::move(tablet_token_range));
-                            }
-                        }
                     }
                     if (range) {
                         break;
@@ -880,6 +873,7 @@ static future<bool> scan_table(
             // Note that because of issue #9167 we need to run a separate query on each partition range, and can't pass
             // several of them into one partition_range_vector that is passed to scan_table_ranges().
             co_await scan_table_ranges(proxy, scan_ctx, {std::move(*range)}, tg_as, page_sem, expiration_stats);
+            std::optional<lowres_clock::duration> should_sleep = pacer.should_sleep();
             if (abort_source.abort_requested()) {
                 // Return when scan was aborted, *not* when tablet_guard
                 // aborted scan_table_ranges due to this tablet being affected.
@@ -887,6 +881,14 @@ static future<bool> scan_table(
             }
             sub = {}; // sub had reference to tablet_guard which is about to be reset
             tablet_guard.reset();
+            if (should_sleep) {
+                try {
+                    co_await sleep_abortable(*should_sleep, abort_source);
+                }
+                catch (const seastar::sleep_aborted&) {
+                    co_return true;
+                }
+            }
         } while (*last_token < dht::last_token());
     } else {  // VNodes
         locator::static_effective_replication_map_ptr ermp =
@@ -927,6 +929,71 @@ static future<bool> scan_table(
     co_return true;
 }
 
+static bool this_shard_scans_tablet(
+    const locator::tablet_map& tablet_map,
+    const locator::tablet_id& tablet,
+    const locator::effective_replication_map_ptr& erm,
+    const gms::gossiper& gossiper,
+    const locator::host_id& my_host_id
+) {
+    auto tablet_primary_replica = tablet_map.get_primary_replica(tablet, erm->get_topology());
+    if (tablet_primary_replica.host == my_host_id && tablet_primary_replica.shard == this_shard_id()) {
+        return true;
+    } else if (erm->get_replication_factor() > 1) {
+        // If each node only scans its own primary ranges, then when any node is
+        // down part of the token range will not get scanned. This can be viewed
+        // as acceptable (when it comes back online, it will resume its scan),
+        // but as noted in issue #9787, we can allow more prompt expiration
+        // by tasking another node to take over scanning of the dead node's primary
+        // ranges. What we do here is that this node will also check expiration
+        // on its *secondary* ranges - but only those whose primary owner is down.
+        auto tablet_secondary_replica = tablet_map.get_secondary_replica(tablet, erm->get_topology()); // throws if no secondary replica
+        if (tablet_secondary_replica.host == my_host_id && tablet_secondary_replica.shard == this_shard_id()) {
+            return !gossiper.is_alive(tablet_primary_replica.host);
+        }
+    }
+    return false;
+}
+
+static future<uint64_t> count_this_shard_tablets(
+    const data_dictionary::database& db,
+    const std::vector<schema_ptr>& schemas,
+    const gms::gossiper& gossiper,
+    const abort_source& as
+) {
+    uint64_t total_ranges = 0;
+    for (const auto& s : schemas) {
+        co_await coroutine::maybe_yield();
+        if (as.abort_requested()) {
+            co_return 0;
+        }
+        std::optional<std::string> ttl_tag = db::find_tag(*s, TTL_TAG_KEY);
+        try {
+            if (!ttl_tag || !s->table().uses_tablets()) {
+                continue;
+            }
+            auto erm = s->table().get_effective_replication_map();
+            const auto& tablet_map = erm->get_token_metadata().tablets().get_tablet_map(s->id());
+            auto my_host_id = erm->get_topology().my_host_id();
+            for (const auto& tid : tablet_map.tablet_ids()) {
+                if (this_shard_scans_tablet(tablet_map, tid, erm, gossiper, my_host_id)) {
+                    total_ranges++;
+                }
+            }
+        }
+        catch (...) {
+            if (db.has_schema(s->ks_name(), s->cf_name())) {
+                tlogger.warn("table {}.{} tablet count failed: {}",
+                    s->ks_name(), s->cf_name(), std::current_exception());
+            } else {
+                tlogger.info("tablet count failed when table {}.{} was deleted",
+                    s->ks_name(), s->cf_name());
+            }
+        }
+    }
+    co_return total_ranges;
+}
+
 
 future<> expiration_service::run() {
     // FIXME: don't just tight-loop, think about timing, pace, and
@@ -943,13 +1010,19 @@ future<> expiration_service::run() {
         for (auto cf : _db.get_tables()) {
             schemas.push_back(cf.schema());
         }
+        uint64_t this_shard_partition_ranges = co_await count_this_shard_tablets(_db, schemas, _gossiper, _abort_source);
+        if (shutting_down()) {
+            co_return;
+        }
+        // Try to finish the scan exactly in 90% of the allotted time.
+        ttl_scan_pacer pacer(_db.get_config().alternator_ttl_period_in_seconds() * 0.9, this_shard_partition_ranges);
         for (schema_ptr s : schemas) {
             co_await coroutine::maybe_yield();
             if (shutting_down()) {
                 co_return;
             }
             try {
-                co_await scan_table(_proxy, _db, _gossiper, s, _abort_source, _page_sem, _expiration_stats);
+                co_await scan_table(_proxy, _db, _gossiper, s, _abort_source, pacer, _page_sem, _expiration_stats);
             } catch (...) {
                 // The scan of a table may fail in the middle for many
                 // reasons, including network failure and even the table
