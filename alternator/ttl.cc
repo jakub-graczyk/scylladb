@@ -36,7 +36,7 @@
 #include "gms/feature_service.hh"
 #include "mutation/mutation.hh"
 #include "types/types.hh"
-#include "types/map.hh"
+#include "types/listlike_partial_deserializing_iterator.hh"
 #include "utils/assert.hh"
 #include "utils/rjson.hh"
 #include "utils/big_decimal.hh"
@@ -59,6 +59,14 @@
 static logging::logger tlogger("alternator_ttl");
 
 namespace alternator {
+
+static bool this_shard_scans_tablet(
+    const locator::tablet_map& tablet_map,
+    const locator::tablet_id& tablet,
+    const locator::effective_replication_map_ptr& erm,
+    const gms::gossiper& gossiper,
+    const locator::host_id& my_host_id
+);
 
 future<executor::request_return_type> executor::update_time_to_live(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
     _stats.api_operations.update_time_to_live++;
@@ -123,7 +131,7 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
 future<executor::request_return_type> executor::describe_time_to_live(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
     _stats.api_operations.describe_time_to_live++;
     schema_ptr schema = get_table(_proxy, request);
-    
+
     maybe_audit(audit_info, audit::statement_category::QUERY,
                 schema->ks_name(), schema->cf_name(), "DescribeTimeToLive", request);
 
@@ -240,6 +248,26 @@ static bool is_expired(const rjson::value& expiration_time, gc_clock::time_point
     return n && is_expired(*n, now);
 }
 
+// Cells in the map are sorted by key order. Use that fact to find the key value
+// pair without materializing the whole :attrs map.
+static std::optional<managed_bytes_view> zero_copy_find_value_bytes_in_map(managed_bytes_view map, bytes_view key) {
+    const single_fragmented_view member_view{key};
+    int size = read_collection_size(map);
+    while (size--) {
+        managed_bytes_view key = read_collection_key(map);
+        managed_bytes_view value = read_collection_value_nonnull(map);
+        const std::strong_ordering cmp = compare_unsigned(key, member_view);
+        if (cmp == 0) {
+            return value;
+        }
+        if (cmp > 0) {
+            // Keys are sorted, so we're already past where it would have been.
+            break;
+        }
+    }
+    return std::nullopt;
+}
+
 // expire_item() expires an item - i.e., deletes it as appropriate for
 // expiration - with CL=QUORUM and (FIXME!) in a way Alternator Streams
 // understands it is an expiration event - not a user-initiated deletion.
@@ -266,7 +294,7 @@ static future<> expire_item(service::storage_proxy& proxy,
         }
         exploded_pk.push_back(to_bytes(*row_c));
     }
-    auto pk = partition_key::from_exploded(exploded_pk);
+    auto pk = partition_key::from_exploded(std::move(exploded_pk));
     mutation m(schema, pk);
     // If there's no clustering key, a tombstone should be created directly
     // on a partition, not on a clustering row - otherwise it will look like
@@ -286,7 +314,7 @@ static future<> expire_item(service::storage_proxy& proxy,
             }
             exploded_ck.push_back(to_bytes(*row_c));
         }
-        auto ck = clustering_key::from_exploded(exploded_ck);
+        auto ck = clustering_key::from_exploded(std::move(exploded_ck));
         m.partition().clustered_row(*schema, ck).apply(tombstone(ts, gc_clock::now()));
     }
     utils::chunked_vector<mutation> mutations;
@@ -502,11 +530,50 @@ public:
     }
 };
 
+class ttl_scan_pacer {
+    using sec_duration = std::chrono::duration<double>;
+
+    static sec_duration now() {
+        return std::chrono::duration_cast<sec_duration>(lowres_clock::now().time_since_epoch());
+    }
+
+    sec_duration _scan_started;
+    sec_duration _target;
+    uint64_t _work_to_do;
+    uint64_t _work_done = 0;
+public:
+    ttl_scan_pacer(double time_target, uint64_t work_to_do)
+        : _scan_started(now())
+        , _target(sec_duration{time_target})
+        , _work_to_do(work_to_do)
+    {
+    }
+
+    std::optional<lowres_clock::duration> should_sleep() {
+        if (!_work_to_do) {
+            return std::nullopt;
+        }
+        ++_work_done;
+        if (_work_done >= _work_to_do) {
+            return std::nullopt;
+        }
+        sec_duration elapsed = now() - _scan_started;
+        if (elapsed >= _target) {
+            return std::nullopt;
+        }
+        sec_duration should_sleep = static_cast<double>(_work_done) * _target / _work_to_do - elapsed;
+        if (should_sleep <= sec_duration::zero()) {
+            return std::nullopt;
+        }
+        return std::chrono::duration_cast<lowres_clock::duration>(should_sleep);
+    }
+};
+
 // Precomputed information needed to perform a scan on partition ranges
 struct scan_ranges_context {
     schema_ptr s;
     bytes column_name;
-    std::optional<std::string> member;
+    std::optional<bytes> member;
 
     service::client_state internal_client_state;
     ::shared_ptr<cql3::selection::selection> selection;
@@ -514,7 +581,7 @@ struct scan_ranges_context {
     std::unique_ptr<cql3::query_options> query_options;
     ::lw_shared_ptr<query::read_command> command;
 
-    scan_ranges_context(schema_ptr s, service::storage_proxy& proxy, bytes column_name, std::optional<std::string> member)
+    scan_ranges_context(schema_ptr s, service::storage_proxy& proxy, bytes column_name, std::optional<bytes> member)
         : s(s)
         , column_name(column_name)
         , member(member)
@@ -612,33 +679,28 @@ static future<> scan_table_ranges(
         if (!expiration_column) {
             continue;
         }
+        const auto now = gc_clock::now();
         for (const auto& row : rows) {
             const managed_bytes_opt& cell = row[*expiration_column];
             if (!cell) {
                 continue;
             }
-            auto v = meta[*expiration_column]->type->deserialize(*cell);
+
             bool expired = false;
-            // FIXME: don't recalculate "now" all the time
-            auto now = gc_clock::now();
             if (scan_ctx.member) {
                 // In this case, the expiration-time attribute we're
                 // looking for is a member in a map, saved serialized
                 // into bytes using Alternator's serialization (basically
                 // a JSON serialized into bytes)
-                // FIXME: is it possible to find a specific member of a map
-                // without iterating through it like we do here and compare
-                // the key?
-                for (const auto& entry : value_cast<map_type_impl::native_type>(v)) {
-                    std::string attr_name = value_cast<sstring>(entry.first);
-                    if (value_cast<sstring>(entry.first) == *scan_ctx.member) {
-                        bytes value = value_cast<bytes>(entry.second);
-                        rjson::value json = deserialize_item(value);
-                        expired = is_expired(json, now);
-                        break;
-                    }
+                std::optional<managed_bytes_view> value =
+                    zero_copy_find_value_bytes_in_map(managed_bytes_view(*cell), *scan_ctx.member);
+                if (value) {
+                    expired = value->with_linearized([now] (bytes_view bv) {
+                        return is_expired(deserialize_item(bv), now);
+                    });
                 }
             } else {
+                auto v = meta[*expiration_column]->type->deserialize(*cell);
                 // For a real column to contain an expiration time, it
                 // must be a numeric type. We currently support decimal
                 // (used by Alternator TTL) as well as bigint, int and
@@ -711,6 +773,7 @@ static future<bool> scan_table(
     gms::gossiper& gossiper,
     schema_ptr s,
     abort_source& abort_source,
+    ttl_scan_pacer& pacer,
     named_semaphore& page_sem,
     expiration_service::stats& expiration_stats)
 {
@@ -730,12 +793,12 @@ static future<bool> scan_table(
     // (counting milliseconds).
     bytes column_name = to_bytes(*attribute_name);
     const column_definition *cd = s->get_column_definition(column_name);
-    std::optional<std::string> member;
+    std::optional<bytes> member;
     if (!cd) {
-        member = std::move(attribute_name);
+        member = std::move(column_name);
         column_name = bytes(executor::ATTRS_COLUMN_NAME);
         cd = s->get_column_definition(column_name);
-        tlogger.info("table {} TTL enabled with attribute {} in {}", s->cf_name(), *member, executor::ATTRS_COLUMN_NAME);
+        tlogger.info("table {} TTL enabled with attribute {} in {}", s->cf_name(), *attribute_name, executor::ATTRS_COLUMN_NAME);
     } else {
         tlogger.info("table {} TTL enabled with attribute {}", s->cf_name(), *attribute_name);
     }
@@ -775,25 +838,10 @@ static future<bool> scan_table(
                 // The loop finds the tablet range to scan, one which we are the primary replica for,
                 // or if the primary replica is down, one which we are the secondary replica for.
                 do {
-                    auto tablet_token_range = tablet_map.get_token_range(*tablet);
                     last_token = tablet_map.get_last_token(*tablet);
-                    auto tablet_primary_replica = tablet_map.get_primary_replica(*tablet, erm->get_topology());
-                    if (tablet_primary_replica.host == my_host_id && tablet_primary_replica.shard == this_shard_id()) {
+                    if (this_shard_scans_tablet(tablet_map, *tablet, erm, gossiper, my_host_id)) {
+                        auto tablet_token_range = tablet_map.get_token_range(*tablet);
                         range = dht::to_partition_range(std::move(tablet_token_range));
-                    } else if (erm->get_replication_factor() > 1) {
-                        // If each node only scans its own primary ranges, then when any node is
-                        // down part of the token range will not get scanned. This can be viewed
-                        // as acceptable (when it comes back online, it will resume its scan),
-                        // but as noted in issue #9787, we can allow more prompt expiration
-                        // by tasking another node to take over scanning of the dead node's primary
-                        // ranges. What we do here is that this node will also check expiration
-                        // on its *secondary* ranges - but only those whose primary owner is down.
-                        auto tablet_secondary_replica = tablet_map.get_secondary_replica(*tablet, erm->get_topology()); // throws if no secondary replica
-                        if (tablet_secondary_replica.host == my_host_id && tablet_secondary_replica.shard == this_shard_id()) {
-                            if (!gossiper.is_alive(tablet_primary_replica.host)) {
-                                range = dht::to_partition_range(std::move(tablet_token_range));
-                            }
-                        }
                     }
                     if (range) {
                         break;
@@ -812,10 +860,35 @@ static future<bool> scan_table(
               // which would otherwise be held up by us keeping the ERM.
               // tablet_guard blocks only the selected tablet.
 
+            // Register a callback on abort_source to signal also tablet_guard's
+            // abort source. This allows for scan_table_ranges to finish quickly
+            // when the erm is stale aborting the scan mid parittion range.
+            auto& tg_as = tablet_guard->get_abort_source();
+            auto sub = abort_source.subscribe([&tg_as] () noexcept {tg_as.request_abort();});
+            if (abort_source.abort_requested()) {
+                // This can happen when scan was aborted before callback was
+                // registered
+                co_return true;
+            }
             // Note that because of issue #9167 we need to run a separate query on each partition range, and can't pass
             // several of them into one partition_range_vector that is passed to scan_table_ranges().
-            co_await scan_table_ranges(proxy, scan_ctx, {std::move(*range)}, abort_source, page_sem, expiration_stats);
+            co_await scan_table_ranges(proxy, scan_ctx, {std::move(*range)}, tg_as, page_sem, expiration_stats);
+            std::optional<lowres_clock::duration> should_sleep = pacer.should_sleep();
+            if (abort_source.abort_requested()) {
+                // Return when scan was aborted, *not* when tablet_guard
+                // aborted scan_table_ranges due to this tablet being affected.
+                co_return true;
+            }
+            sub = {}; // sub had reference to tablet_guard which is about to be reset
             tablet_guard.reset();
+            if (should_sleep) {
+                try {
+                    co_await sleep_abortable(*should_sleep, abort_source);
+                }
+                catch (const seastar::sleep_aborted&) {
+                    co_return true;
+                }
+            }
         } while (*last_token < dht::last_token());
     } else {  // VNodes
         locator::static_effective_replication_map_ptr ermp =
@@ -856,6 +929,71 @@ static future<bool> scan_table(
     co_return true;
 }
 
+static bool this_shard_scans_tablet(
+    const locator::tablet_map& tablet_map,
+    const locator::tablet_id& tablet,
+    const locator::effective_replication_map_ptr& erm,
+    const gms::gossiper& gossiper,
+    const locator::host_id& my_host_id
+) {
+    auto tablet_primary_replica = tablet_map.get_primary_replica(tablet, erm->get_topology());
+    if (tablet_primary_replica.host == my_host_id && tablet_primary_replica.shard == this_shard_id()) {
+        return true;
+    } else if (erm->get_replication_factor() > 1) {
+        // If each node only scans its own primary ranges, then when any node is
+        // down part of the token range will not get scanned. This can be viewed
+        // as acceptable (when it comes back online, it will resume its scan),
+        // but as noted in issue #9787, we can allow more prompt expiration
+        // by tasking another node to take over scanning of the dead node's primary
+        // ranges. What we do here is that this node will also check expiration
+        // on its *secondary* ranges - but only those whose primary owner is down.
+        auto tablet_secondary_replica = tablet_map.get_secondary_replica(tablet, erm->get_topology()); // throws if no secondary replica
+        if (tablet_secondary_replica.host == my_host_id && tablet_secondary_replica.shard == this_shard_id()) {
+            return !gossiper.is_alive(tablet_primary_replica.host);
+        }
+    }
+    return false;
+}
+
+static future<uint64_t> count_this_shard_tablets(
+    const data_dictionary::database& db,
+    const std::vector<schema_ptr>& schemas,
+    const gms::gossiper& gossiper,
+    const abort_source& as
+) {
+    uint64_t total_ranges = 0;
+    for (const auto& s : schemas) {
+        co_await coroutine::maybe_yield();
+        if (as.abort_requested()) {
+            co_return 0;
+        }
+        std::optional<std::string> ttl_tag = db::find_tag(*s, TTL_TAG_KEY);
+        try {
+            if (!ttl_tag || !s->table().uses_tablets()) {
+                continue;
+            }
+            auto erm = s->table().get_effective_replication_map();
+            const auto& tablet_map = erm->get_token_metadata().tablets().get_tablet_map(s->id());
+            auto my_host_id = erm->get_topology().my_host_id();
+            for (const auto& tid : tablet_map.tablet_ids()) {
+                if (this_shard_scans_tablet(tablet_map, tid, erm, gossiper, my_host_id)) {
+                    total_ranges++;
+                }
+            }
+        }
+        catch (...) {
+            if (db.has_schema(s->ks_name(), s->cf_name())) {
+                tlogger.warn("table {}.{} tablet count failed: {}",
+                    s->ks_name(), s->cf_name(), std::current_exception());
+            } else {
+                tlogger.info("tablet count failed when table {}.{} was deleted",
+                    s->ks_name(), s->cf_name());
+            }
+        }
+    }
+    co_return total_ranges;
+}
+
 
 future<> expiration_service::run() {
     // FIXME: don't just tight-loop, think about timing, pace, and
@@ -872,13 +1010,19 @@ future<> expiration_service::run() {
         for (auto cf : _db.get_tables()) {
             schemas.push_back(cf.schema());
         }
+        uint64_t this_shard_partition_ranges = co_await count_this_shard_tablets(_db, schemas, _gossiper, _abort_source);
+        if (shutting_down()) {
+            co_return;
+        }
+        // Try to finish the scan exactly in 90% of the allotted time.
+        ttl_scan_pacer pacer(_db.get_config().alternator_ttl_period_in_seconds() * 0.9, this_shard_partition_ranges);
         for (schema_ptr s : schemas) {
             co_await coroutine::maybe_yield();
             if (shutting_down()) {
                 co_return;
             }
             try {
-                co_await scan_table(_proxy, _db, _gossiper, s, _abort_source, _page_sem, _expiration_stats);
+                co_await scan_table(_proxy, _db, _gossiper, s, _abort_source, pacer, _page_sem, _expiration_stats);
             } catch (...) {
                 // The scan of a table may fail in the middle for many
                 // reasons, including network failure and even the table
