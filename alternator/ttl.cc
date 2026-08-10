@@ -550,10 +550,10 @@ public:
     }
 
     std::optional<lowres_clock::duration> should_sleep() {
+        ++_work_done;
         if (!_work_to_do) {
             return std::nullopt;
         }
-        ++_work_done;
         if (_work_done >= _work_to_do) {
             return std::nullopt;
         }
@@ -1010,12 +1010,14 @@ future<> expiration_service::run() {
         for (auto cf : _db.get_tables()) {
             schemas.push_back(cf.schema());
         }
-        uint64_t this_shard_partition_ranges = co_await count_this_shard_tablets(_db, schemas, _gossiper, _abort_source);
+        uint64_t this_shard_tablets = co_await count_this_shard_tablets(_db, schemas, _gossiper, _abort_source);
         if (shutting_down()) {
             co_return;
         }
         // Try to finish the scan exactly in 90% of the allotted time.
-        ttl_scan_pacer pacer(_db.get_config().alternator_ttl_period_in_seconds() * 0.9, this_shard_partition_ranges);
+        // Note: pacer starts counting the scan time in the constructor below compared to above start timestamp
+        // which measures also work estimation in count_this_shard_tablets.
+        ttl_scan_pacer pacer(_db.get_config().alternator_ttl_period_in_seconds() * 0.9, this_shard_tablets);
         for (schema_ptr s : schemas) {
             co_await coroutine::maybe_yield();
             if (shutting_down()) {
