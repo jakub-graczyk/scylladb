@@ -43,6 +43,10 @@ public:
         uint64_t scan_table = 0;
         uint64_t items_deleted = 0;
         uint64_t secondary_ranges_scanned = 0;
+        uint64_t last_scan_duration_ms = 0;
+        uint64_t last_scan_sleep_ms = 0;
+        uint64_t last_scan_estimated_work_units = 0;
+        uint64_t last_scan_done_work_units = 0;
     private:
         // The metric_groups object holds this stat object's metrics registered
         // as long as the stats object is alive.

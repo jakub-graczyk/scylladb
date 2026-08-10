@@ -539,6 +539,7 @@ class ttl_scan_pacer {
 
     sec_duration _scan_started;
     sec_duration _target;
+    sec_duration _recommended_total_time_to_sleep{0};
     uint64_t _work_to_do;
     uint64_t _work_done = 0;
 public:
@@ -547,6 +548,18 @@ public:
         , _target(sec_duration{time_target})
         , _work_to_do(work_to_do)
     {
+    }
+
+    lowres_clock::duration total_time_to_sleep_recommended() const {
+        return std::chrono::duration_cast<lowres_clock::duration>(_recommended_total_time_to_sleep);
+    }
+
+    uint64_t work_registered() const {
+        return _work_done;
+    }
+
+    uint64_t work_planned() const {
+        return _work_to_do;
     }
 
     std::optional<lowres_clock::duration> should_sleep() {
@@ -565,6 +578,7 @@ public:
         if (should_sleep <= sec_duration::zero()) {
             return std::nullopt;
         }
+        _recommended_total_time_to_sleep += should_sleep;
         return std::chrono::duration_cast<lowres_clock::duration>(should_sleep);
     }
 };
@@ -1052,6 +1066,11 @@ future<> expiration_service::run() {
         // finer-grain sleeps into the scanning code.
         std::chrono::milliseconds scan_duration(std::chrono::duration_cast<std::chrono::milliseconds>(lowres_clock::now() - start));
         std::chrono::milliseconds period(long(_db.get_config().alternator_ttl_period_in_seconds() * 1000));
+        _expiration_stats.last_scan_duration_ms = scan_duration.count();
+        _expiration_stats.last_scan_sleep_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(pacer.total_time_to_sleep_recommended()).count();
+        _expiration_stats.last_scan_estimated_work_units = pacer.work_planned();
+        _expiration_stats.last_scan_done_work_units = pacer.work_registered();
         if (scan_duration < period) {
             try {
                 tlogger.info("sleeping {} seconds until next period", (period - scan_duration).count()/1000.0);
@@ -1096,6 +1115,14 @@ expiration_service::stats::stats() {
             seastar::metrics::description("number of items deleted after expiration"))(basic_level)(alternator_label).set_skip_when_empty(),
         seastar::metrics::make_total_operations("secondary_ranges_scanned", secondary_ranges_scanned,
             seastar::metrics::description("number of token ranges scanned by this node while their primary owner was down"))(alternator_label).set_skip_when_empty(),
+        seastar::metrics::make_gauge("last_scan_duration_ms", last_scan_duration_ms,
+            seastar::metrics::description("time to complete last scan in milliseconds"))(alternator_label),
+        seastar::metrics::make_gauge("last_scan_sleep_ms", last_scan_sleep_ms,
+            seastar::metrics::description("time spent asleep during last scan in milliseconds"))(alternator_label),
+        seastar::metrics::make_gauge("last_scan_estimated_work_units", last_scan_estimated_work_units,
+            seastar::metrics::description("number of estimated tablets to scan during last scan"))(alternator_label),
+        seastar::metrics::make_gauge("last_scan_done_work_units", last_scan_done_work_units,
+            seastar::metrics::description("number of tablets scanned during last scan"))(alternator_label),
     });
 }
 
