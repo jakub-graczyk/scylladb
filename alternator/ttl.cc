@@ -180,10 +180,11 @@ future<executor::request_return_type> executor::describe_time_to_live(client_sta
 // like user deletions, will also appear on the CDC log and therefore
 // Alternator Streams if enabled - currently as ordinary deletes (the
 // userIdentity flag is currently missing this is issue #11523).
-expiration_service::expiration_service(data_dictionary::database db, service::storage_proxy& proxy, gms::gossiper& g)
+expiration_service::expiration_service(data_dictionary::database db, service::storage_proxy& proxy, gms::gossiper& g, std::optional<seastar::scheduling_group> sched_group)
         : _db(db)
         , _proxy(proxy)
         , _gossiper(g)
+        , _sched_group(sched_group)
 {
 }
 
@@ -1086,6 +1087,18 @@ future<> expiration_service::start() {
     // Called by main() on each shard to start the expiration-service
     // thread. Just runs run() in the background and allows stop().
     if (!shutting_down()) {
+        if (_sched_group) {
+            auto apply_shares = [this] (const uint32_t& shares) {
+                if (shares < 1) {
+                    tlogger.warn("alternator_ttl_scheduling_group_shares={} is too low, using 1", shares);
+                }
+                _sched_group->set_shares(std::max(shares, 1u));
+            };
+            const db::config& cfg = _db.get_config();
+            uint32_t shares = cfg.alternator_ttl_scheduling_group_shares();
+            apply_shares(shares);
+            _shares_observer = cfg.alternator_ttl_scheduling_group_shares.observe(std::move(apply_shares));
+        }
         _end = run().handle_exception([] (std::exception_ptr ep) {
             tlogger.error("expiration_service failed: {}", ep);
         });

@@ -12,6 +12,8 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/scheduling.hh>
+#include "utils/observable.hh"
 #include "data_dictionary/data_dictionary.hh"
 
 namespace gms {
@@ -56,6 +58,8 @@ private:
     data_dictionary::database _db;
     service::storage_proxy& _proxy;
     gms::gossiper& _gossiper;
+    std::optional<seastar::scheduling_group> _sched_group;
+    std::optional<utils::observer<uint32_t>> _shares_observer;
     // _end is set by start(), and resolves when the background service
     // started by it ends. To ask the background service to end, _abort_source
     // should be triggered. stop() below uses both _abort_source and _end.
@@ -69,7 +73,7 @@ public:
     // sharded_service<expiration_service>::start() creates this object on
     // all shards, so calls this constructor on each shard. Later, the
     // additional start() function should be invoked on all shards.
-    expiration_service(data_dictionary::database, service::storage_proxy&, gms::gossiper&);
+    expiration_service(data_dictionary::database, service::storage_proxy&, gms::gossiper&, std::optional<seastar::scheduling_group>);
     future<> start();
     future<> run();
     // sharded_service<expiration_service>::stop() calls the following stop()

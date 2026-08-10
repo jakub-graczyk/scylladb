@@ -1240,7 +1240,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             bool alternator_ttl_scheduling_group_set = false;
             auto alternator_ttl_scheduling_group = dbcfg.streaming_scheduling_group;
             if (cfg->alternator_port() || cfg->alternator_https_port()) {
-                alternator_ttl_scheduling_group = create_scheduling_group("alternator_ttl", "attl", 200, maintenance_supergroup).get();
+                alternator_ttl_scheduling_group = create_scheduling_group("alternator_ttl", "attl", cfg->alternator_ttl_scheduling_group_shares(), maintenance_supergroup).get();
                 alternator_ttl_scheduling_group_set = true;
             }
 
@@ -2745,7 +2745,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             // and by CQL (for its per-row TTL feature).
             checkpoint(stop_signal, "starting the expiration service");
             es.start(seastar::sharded_parameter([] (const replica::database& db) { return db.as_data_dictionary(); }, std::ref(db)),
-                         std::ref(proxy), std::ref(gossiper)).get();
+                         std::ref(proxy), std::ref(gossiper), alternator_ttl_scheduling_group_set ? std::optional(alternator_ttl_scheduling_group) : std::nullopt).get();
             stop_expiration_service = defer_verbose_shutdown("expiration service", [&es] {
                 es.stop().get();
             });

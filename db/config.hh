@@ -519,6 +519,7 @@ public:
     named_value<bool> alternator_streams_increased_compatibility;
     named_value<uint32_t> alternator_timeout_in_ms;
     named_value<double> alternator_ttl_period_in_seconds;
+    named_value<uint32_t> alternator_ttl_scheduling_group_shares;
     named_value<sstring> alternator_describe_endpoints;
     named_value<uint32_t> alternator_max_items_in_batch_write;
     named_value<bool> alternator_allow_system_table_write;

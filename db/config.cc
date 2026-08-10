@@ -726,7 +726,7 @@ using namespace std::chrono_literals;
 db::config::config(std::shared_ptr<db::extensions> exts)
     : utils::config_file()
     /**
-    * Annotations used for autogenerating documentation. 
+    * Annotations used for autogenerating documentation.
     * @Group: Names the category of subsequent config properties.
     * @GroupDescription: Provides an overview of the group.
     */
@@ -889,7 +889,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Related information: Enabling incremental backups")
     , snapshot_before_compaction(this, "snapshot_before_compaction", value_status::Unused, false,
         "Enable or disable taking a snapshot before each compaction. This option is useful to back up data when there is a data format change. Be careful using this option because Cassandra does not clean up older snapshots automatically.\n"
-        "\n"  
+        "\n"
         "Related information: Configuring compaction")
     /**
     * @Group Common fault detection setting
@@ -1333,7 +1333,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "* com.scylladb.auth.TransitionalAuthenticator: Wraps around the PasswordAuthenticator, logging them in if username/password pair provided is correct and treating them as anonymous users otherwise.\n"
         "* com.scylladb.auth.SaslauthdAuthenticator : Use saslauthd for authentication.\n"
         "\n"
-        "Related information: Internal authentication", 
+        "Related information: Internal authentication",
         {"AllowAllAuthenticator", "PasswordAuthenticator", "CertificateAuthenticator", "org.apache.cassandra.auth.PasswordAuthenticator", "com.scylladb.auth.SaslauthdAuthenticator", "org.apache.cassandra.auth.AllowAllAuthenticator", "com.scylladb.auth.TransitionalAuthenticator", "com.scylladb.auth.CertificateAuthenticator"})
     , internode_authenticator(this, "internode_authenticator", value_status::Unused, "enabled",
         "Internode authentication backend. It implements org.apache.cassandra.auth.AllowAllInternodeAuthenticator to allows or disallow connections from peer nodes.")
@@ -1575,7 +1575,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , cdc_dont_rewrite_streams(this, "cdc_dont_rewrite_streams", value_status::Used, false,
             "Disable rewriting streams from cdc_streams_descriptions to cdc_streams_descriptions_v2. Should not be necessary, but the procedure is expensive and prone to failures; this config option is left as a backdoor in case some user requires manual intervention.")
     , strict_allow_filtering(this, "strict_allow_filtering", liveness::LiveUpdate, value_status::Used, strict_allow_filtering_default(), "Match Cassandra in requiring ALLOW FILTERING on slow queries. Can be true, false, or warn. When false, Scylla accepts some slow queries even without ALLOW FILTERING that Cassandra rejects. Warn is same as false, but with warning.")
-    , strict_is_not_null_in_views(this, "strict_is_not_null_in_views", liveness::LiveUpdate, value_status::Used,db::tri_mode_restriction_t::mode::WARN, 
+    , strict_is_not_null_in_views(this, "strict_is_not_null_in_views", liveness::LiveUpdate, value_status::Used,db::tri_mode_restriction_t::mode::WARN,
         "In materialized views, restrictions are allowed only on the view's primary key columns.\n"
         "In old versions Scylla mistakenly allowed IS NOT NULL restrictions on columns which were not part of the view's"
         " primary key. These invalid restrictions were ignored.\n"
@@ -1620,6 +1620,10 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , alternator_ttl_period_in_seconds(this, "alternator_ttl_period_in_seconds", value_status::Used,
         60*60*24,
         "The default period for Alternator's expiration scan. Alternator attempts to scan every table within that period.")
+    , alternator_ttl_scheduling_group_shares(this, "alternator_ttl_scheduling_group_shares", liveness::LiveUpdate, value_status::Used,
+        200,
+        "CPU shares for alternator_ttl_scheduling_group inside the maintenance_supergroup. This has no effect when Alternator is disabled."
+    )
     , alternator_describe_endpoints(this, "alternator_describe_endpoints", liveness::LiveUpdate, value_status::Used,
         "",
         "Overrides the behavior of Alternator's DescribeEndpoints operation. "
@@ -1685,7 +1689,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , live_updatable_config_params_changeable_via_cql(this, "live_updatable_config_params_changeable_via_cql", liveness::MustRestart, value_status::Used, true, "If set to true, configuration parameters defined with LiveUpdate can be updated in runtime via CQL (by updating system.config virtual table), otherwise they can't.")
     , auth_superuser_name(this, "auth_superuser_name", value_status::Used, "",
         "Initial authentication super username. Ignored if authentication tables already contain a super user.")
-    , auth_superuser_salted_password(this, "auth_superuser_salted_password", value_status::Used, "", 
+    , auth_superuser_salted_password(this, "auth_superuser_salted_password", value_status::Used, "",
         "Initial authentication super user salted password. Create using mkpassword or similar. The hashing algorithm used must be available on the node host. "
         "Ignored if authentication tables already contain a super user password.")
     , auth_certificate_role_queries(this, "auth_certificate_role_queries", value_status::Used, { { { "source", "SUBJECT" }, {"query", "CN=([^,]+)" } } },
