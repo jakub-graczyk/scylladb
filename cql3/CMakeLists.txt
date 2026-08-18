@@ -49,6 +49,7 @@ target_sources(cql3
     functions/error_injection_fcts.cc
     statements/strong_consistency/select_statement.cc
     statements/strong_consistency/modification_statement.cc
+    statements/strong_consistency/batch_statement.cc
     statements/strong_consistency/statement_helpers.cc
     functions/vector_similarity_fcts.cc
     functions/scoring_fcts.cc
@@ -76,8 +77,6 @@ target_sources(cql3
     statements/raw/parsed_statement.cc
     statements/property_definitions.cc
     statements/update_statement.cc
-    statements/broadcast_modification_statement.cc
-    statements/broadcast_select_statement.cc
     statements/delete_statement.cc
     statements/prune_materialized_view_statement.cc
     statements/batch_statement.cc

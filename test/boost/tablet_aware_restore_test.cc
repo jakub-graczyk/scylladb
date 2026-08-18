@@ -301,7 +301,14 @@ using namespace sstables;
 
 future<sstring> backup(cql_test_env& env, sstring endpoint, sstring bucket) {
     sharded<db::snapshot_ctl> ctl;
-    co_await ctl.start(std::ref(env.db()), std::ref(env.get_storage_proxy()), std::ref(env.get_task_manager()), std::ref(env.get_sstorage_manager()), db::snapshot_ctl::config{});
+    co_await ctl.start(std::ref(env.db())
+        , std::ref(env.get_storage_proxy())
+        , std::ref(env.qp())
+        , std::ref(env.get_messaging_service())
+        , std::ref(env.get_task_manager())
+        , std::ref(env.get_sstorage_manager())
+        , db::snapshot_ctl::config{}
+    );
     auto prefix = fmt::format("/backup-{}", utils::UUID_gen::get_time_UUID());
 
     auto task_id = co_await ctl.local().start_backup(endpoint, bucket, prefix, "ks", "cf", "snapshot", false);
@@ -346,7 +353,6 @@ SEASTAR_TEST_CASE(test_populate_snapshot_sstables_from_manifests, *boost::unit_t
 
     auto db_cfg_ptr = make_shared<db::config>();
     db_cfg_ptr->tablets_mode_for_new_keyspaces(db::tablets_mode_t::mode::enabled);
-    db_cfg_ptr->experimental_features({db::experimental_features_t::feature::KEYSPACE_STORAGE_OPTIONS});
     auto storage_options = make_test_object_storage_options("S3");
     db_cfg_ptr->object_storage_endpoints(make_storage_options_config(storage_options));
 

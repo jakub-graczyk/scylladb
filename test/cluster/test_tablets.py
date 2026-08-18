@@ -192,6 +192,20 @@ async def test_stop_reshape_aborts_all_compaction_groups(manager: ManagerClient)
             logger.info("Waiting for reshape to hit the injection point")
             await manager.api.wait_for_injection_enter(server.ip_addr, injection,
                                                        threshold=1, deadline=time.time() + 60)
+            async def reshape_tasks_registered():
+                compactions = await manager.api.client.get_json("/compaction_manager/compactions", host=server.ip_addr)
+                reshapes = [
+                    c for c in compactions
+                    if c["task_type"] == "RESHAPE"
+                    and c["ks"] in [ks1, ks2]
+                    and c["cf"] == "test"
+                ]
+                return True if len(reshapes) >= 2 else None
+
+            await wait_for(
+                reshape_tasks_registered,
+                time.time() + 60,
+                label="registered reshape compactions")
 
             logger.info("Stopping RESHAPE globally and releasing injection")
             stop_task = asyncio.create_task(manager.api.stop_compaction(server.ip_addr, "RESHAPE"))
@@ -1320,6 +1334,109 @@ async def test_failed_tablet_rebuild_is_retried_on_alter(manager: ManagerClient)
     assert len(tablet_replicas) == 4
     for r in tablet_replicas:
         assert len(r.replicas) == 2
+
+# Regression test: when the target rack in a rack_list colocation has no
+# available nodes (all excluded), the ALTER KEYSPACE must fail promptly
+# instead of livelocking with the request endlessly bouncing between
+# paused and resumed states.
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_rack_list_colocation_livelock_no_target_nodes(request: pytest.FixtureRequest, manager: ManagerClient) -> None:
+    async def get_replication_options(ks: str, host=None):
+        res = await cql.run_async(f"SELECT * FROM system_schema.keyspaces WHERE keyspace_name = '{ks}'", host=host)
+        repl = parse_replication_options(res[0].replication_v2 or res[0].replication)
+        return repl
+
+    numeric_injection = "create_with_numeric"
+    colocation_injection = "wait_with_rack_list_colocation"
+    config = {
+        "tablets_mode_for_new_keyspaces": "enabled",
+        "error_injections_at_startup": [numeric_injection, colocation_injection],
+        "failure_detector_timeout_in_ms": 2000,
+        "tablet_load_stats_refresh_interval_in_seconds": 1,
+    }
+    cmdline = ['--logger-log-level', 'load_balancer=debug', '--smp=2']
+
+    servers = [
+        await manager.server_add(config=config, cmdline=cmdline, property_file={'dc': 'dc1', 'rack': 'rack1a'}),
+        await manager.server_add(config=config, cmdline=cmdline, property_file={'dc': 'dc1', 'rack': 'rack1a'}),
+        await manager.server_add(config=config, cmdline=cmdline, property_file={'dc': 'dc1', 'rack': 'rack1b'}),
+    ]
+
+    host_ids = [await manager.get_host_id(s.server_id) for s in servers]
+
+    cql = manager.get_cql()
+    hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+    live_host = hosts[0]
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1} AND tablets = {'initial': 8}", host=live_host) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.t (pk int PRIMARY KEY);", host=live_host)
+        repl = await get_replication_options(ks, host=live_host)
+        assert repl['dc1'] == '1'
+
+        # Verify at least one tablet is on rack1a so colocation is triggered
+        # when we ALTER to ['rack1b'].
+        tablet_replicas = await get_all_tablet_replicas(manager, servers[0], ks, "t")
+        rack1a_tablets = [r for r in tablet_replicas if r.replicas[0][0] in (host_ids[0], host_ids[1])]
+        assert len(rack1a_tablets) > 0, "Need at least one tablet on rack1a for colocation to trigger"
+
+        # Disable the numeric injection so ALTER produces rack_list format.
+        for s in servers:
+            await manager.api.disable_injection(s.ip_addr, numeric_injection)
+
+        # Find topology coordinator and open its log.
+        coord = await get_topology_coordinator(manager)
+        coord_serv = await manager.find_server_by_host_id(servers, coord)
+        coord_log = await manager.server_open_log(coord_serv.server_id)
+        mark = await coord_log.mark()
+
+        # ALTER KEYSPACE in background: convert numeric RF=1 to rack_list ['rack1b'].
+        # Tablets on rack1a need colocation to rack1b first. The injection prevents
+        # colocation from progressing.
+        async def alter_keyspace():
+            await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['rack1b']}};", host=live_host)
+        alter_task = asyncio.create_task(alter_keyspace())
+
+        # Wait for the request to be paused for colocation.
+        await coord_log.wait_for(f'keyspace_rf_change for keyspace {ks} postponed for colocation', from_mark=mark)
+
+        # Stop the rack1b node and mark it as excluded. The node remains in the
+        # topology with state=normal but is_excluded()=true, so
+        # make_rack_list_colocation_plan skips it when building nodes_by_load_dst.
+        await manager.server_stop(servers[2].server_id, convict=True)
+        await manager.others_not_see_server(servers[2].ip_addr)
+        await manager.api.exclude_node(servers[0].ip_addr, hosts=[host_ids[2]])
+        live_servers = servers[:2]
+
+        # Re-detect coordinator (may have changed if servers[2] was the coordinator).
+        coord = await get_topology_coordinator(manager)
+        coord_serv = await manager.find_server_by_host_id(live_servers, coord)
+        coord_log = await manager.server_open_log(coord_serv.server_id)
+
+        # Disable the colocation injection on live nodes so the real colocation
+        # plan runs. rack1b has no non-excluded nodes, so the system must detect
+        # the situation and fail the ALTER rather than looping forever.
+        for s in live_servers:
+            await manager.api.disable_injection(s.ip_addr, colocation_injection)
+
+        # The ALTER must complete (with an error) within a reasonable time.
+        # If the livelock bug is present, this times out.
+        try:
+            await asyncio.wait_for(alter_task, timeout=60)
+        except asyncio.TimeoutError:
+            alter_task.cancel()
+            try:
+                await alter_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            pytest.fail("ALTER KEYSPACE livelocked: request kept bouncing between paused and resumed states")
+        except Exception:
+            pass  # Expected: ALTER should fail when target rack has no available nodes
+
+        # The ALTER should not have succeeded — the keyspace must still have
+        # its original numeric RF.
+        repl = await get_replication_options(ks, host=live_host)
+        assert repl['dc1'] == '1'
 
 # Reproducer for https://github.com/scylladb/scylladb/issues/18110
 # Check that an existing cached read, will be cleaned up when the tablet it reads
@@ -2610,3 +2727,92 @@ async def test_split_completion_with_data_in_main_cg(manager: ManagerClient):
         # Release the split monitor hold for clean shutdown.
         await manager.api.message_injection(target.ip_addr, "tablet_split_monitor_wait")
         await manager.server_update_config(target.server_id, "error_injections_at_startup", [])
+
+@pytest.mark.asyncio
+async def test_rf_reduction_preserves_quorum_writes(manager: ManagerClient) -> None:
+    """RF reduction must preserve QUORUM-acknowledged writes even when surviving replicas missed them.
+
+    With RF=5 on 5 nodes (5 racks), write pk=2 at QUORUM while r1/r2 are down, so only r3/r4/r5
+    have it. After restart, reduce RF to 2 keeping only r1/r2. The RF reduction must stream/repair
+    data from removed replicas to surviving ones so that pk=2 remains readable.
+    """
+    # Disable hinted handoff so hints don't replay the writes to r1/r2 after restart,
+    # which would mask the bug by delivering the data before ALTER KEYSPACE runs.
+    cfg = {'hinted_handoff_enabled': False}
+    servers = await manager.servers_add(5, config=cfg, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r3"},
+        {"dc": "dc1", "rack": "r4"},
+        {"dc": "dc1", "rack": "r5"},
+    ])
+
+    cql = manager.get_cql()
+    await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2', 'r3', 'r4', 'r5']} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.t (pk int PRIMARY KEY, v int)")
+
+        # Verify all 5 nodes are replicas for the single tablet.
+        replicas = await get_all_tablet_replicas(manager, servers[0], ks, 't')
+        assert len(replicas) == 1, f"Expected 1 tablet, got {len(replicas)}"
+        assert len(replicas[0].replicas) == 5, f"Expected 5 replicas, got {len(replicas[0].replicas)}"
+
+        # Insert baseline row visible to all nodes.
+        logger.info("Inserting pk=1 at CL=ALL")
+        await cql.run_async(SimpleStatement(f"INSERT INTO {ks}.t (pk, v) VALUES (1, 100)", consistency_level=ConsistencyLevel.ALL))
+        rows = await cql.run_async(SimpleStatement(f"SELECT v FROM {ks}.t WHERE pk = 1", consistency_level=ConsistencyLevel.ALL))
+        assert len(rows) == 1 and rows[0].v == 100
+
+        # Stop r1 and r2 so they miss the next write.
+        logger.info("Stopping r1 and r2")
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_stop_gracefully(servers[1].server_id)
+
+        # Write pk=2 at QUORUM. With 3 live nodes, all 3 (r3/r4/r5) respond. r1/r2 never see it.
+        logger.info("Inserting pk=2 at CL=QUORUM (only r3, r4, r5 have it)")
+        await cql.run_async(SimpleStatement(f"INSERT INTO {ks}.t (pk, v) VALUES (2, 200)", consistency_level=ConsistencyLevel.QUORUM))
+        rows = await cql.run_async(SimpleStatement(f"SELECT v FROM {ks}.t WHERE pk = 2", consistency_level=ConsistencyLevel.QUORUM))
+        assert len(rows) == 1 and rows[0].v == 200
+
+        # Restart the stopped nodes.
+        logger.info("Restarting r1 and r2")
+        await manager.server_start(servers[0].server_id)
+        await manager.server_start(servers[1].server_id)
+        await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+
+        # Reduce RF from 5 to 2, each step removing one rack that had pk=2.
+        logger.info("Reducing RF: 5 -> 4 -> 3 -> 2, keeping only r1 and r2")
+        await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2', 'r4', 'r5']}}")
+        await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2', 'r5']}}")
+        await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2']}}")
+
+        for s in servers:
+            await read_barrier(manager.api, s.ip_addr)
+
+        # Verify only r1 and r2 remain as replicas.
+        replicas_after = await get_all_tablet_replicas(manager, servers[0], ks, 't')
+        assert len(replicas_after) == 1
+        assert len(replicas_after[0].replicas) == 2, f"Expected 2 replicas after RF reduction, got {len(replicas_after[0].replicas)}"
+
+        remaining_host_ids = {host_id for host_id, _ in replicas_after[0].replicas}
+        r1_host_id = await manager.get_host_id(servers[0].server_id)
+        r2_host_id = await manager.get_host_id(servers[1].server_id)
+        assert remaining_host_ids == {r1_host_id, r2_host_id}, f"Expected replicas on r1 and r2, got {remaining_host_ids}"
+
+        # Read directly from r1 and r2 to avoid driver routing to former replicas.
+        logger.info("Verifying data on surviving replicas r1 and r2")
+        cql_r1 = await manager.get_cql_exclusive(servers[0])
+        cql_r2 = await manager.get_cql_exclusive(servers[1])
+
+        for label, excl_cql in [("r1", cql_r1), ("r2", cql_r2)]:
+            # pk=1 (written at ALL) should still be present.
+            rows = await excl_cql.run_async(SimpleStatement(f"SELECT v FROM {ks}.t WHERE pk = 1", consistency_level=ConsistencyLevel.ONE))
+            assert len(rows) == 1 and rows[0].v == 100, f"pk=1 should be present on {label}, got {rows}"
+
+            # pk=2 (written at QUORUM while r1/r2 were down) must still be present.
+            # RF reduction should stream data from removed replicas to surviving ones.
+            rows = await excl_cql.run_async(SimpleStatement(f"SELECT v FROM {ks}.t WHERE pk = 2", consistency_level=ConsistencyLevel.ONE))
+            assert len(rows) == 1 and rows[0].v == 200, f"pk=2 should be present on {label}, got {rows}"
+            logger.info(f"Confirmed: pk=2 is present on {label}")

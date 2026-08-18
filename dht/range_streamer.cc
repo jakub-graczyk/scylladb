@@ -29,7 +29,8 @@ using inet_address = gms::inet_address;
 std::unordered_map<locator::host_id, dht::token_range_vector>
 range_streamer::get_range_fetch_map(const std::unordered_map<dht::token_range, std::vector<locator::host_id>>& ranges_with_sources,
                                     const std::unordered_set<std::unique_ptr<i_source_filter>>& source_filters,
-                                    const sstring& keyspace) {
+                                    const sstring& keyspace,
+                                    const locator::vnode_effective_replication_map* erm) {
     std::unordered_map<locator::host_id, dht::token_range_vector> range_fetch_map_map;
     const auto& topo = _token_metadata_ptr->get_topology();
     for (const auto& x : ranges_with_sources) {
@@ -62,8 +63,7 @@ range_streamer::get_range_fetch_map(const std::unordered_map<dht::token_range, s
         }
 
         if (!found_source) {
-            auto& ks = _db.local().find_keyspace(keyspace);
-            auto rf = ks.get_static_effective_replication_map()->get_replication_factor();
+            auto rf = erm->get_replication_factor();
             // When a replacing node replaces a dead node with keyspace of RF
             // 1, it is expected that replacing node could not find a peer node
             // that contains data to stream from.
@@ -188,7 +188,7 @@ bool range_streamer::use_strict_sources_for_ranges(const sstring& keyspace_name,
     auto nr_nodes_in_ring = get_token_metadata().get_normal_token_owners().size();
     bool everywhere_topology = erm.get_replication_strategy().get_type() == locator::replication_strategy_type::everywhere_topology;
     // Use strict when number of nodes in the ring is equal or more than RF
-    auto strict = _db.local().get_config().consistent_rangemovement()
+    auto strict = _consistent_rangemovement
            && !_tokens.empty()
            && !everywhere_topology
            && nr_nodes_in_ring >= rf;
@@ -232,7 +232,7 @@ future<> range_streamer::add_ranges(const sstring& keyspace_name, locator::stati
         }
     }
 
-    std::unordered_map<locator::host_id, dht::token_range_vector> range_fetch_map = get_range_fetch_map(ranges_for_keyspace, _source_filters, keyspace_name);
+    std::unordered_map<locator::host_id, dht::token_range_vector> range_fetch_map = get_range_fetch_map(ranges_for_keyspace, _source_filters, keyspace_name, erm);
     utils::clear_gently(ranges_for_keyspace).get();
 
     if (logger.is_enabled(logging::log_level::debug)) {
@@ -287,15 +287,14 @@ future<> range_streamer::stream_async() {
                     _nr_ranges_remaining -= ranges_streamed;
                     float percentage = _nr_total_ranges == 0 ? 1 : (_nr_total_ranges - _nr_ranges_remaining) / (float)_nr_total_ranges;
                     _stream_manager.local().update_finished_percentage(_reason, percentage);
-                    logger.info("Finished {} out of {} ranges for {}, finished percentage={}",
-                            _nr_total_ranges - _nr_ranges_remaining, _nr_total_ranges, _reason, percentage);
+                    logger.info("Finished {} out of {} ranges ({:.1f}%) for {}", _nr_total_ranges - _nr_ranges_remaining, _nr_total_ranges, percentage * 100, _reason);
                 };
                 dht::token_range_vector ranges_to_stream;
                 try {
                     for (auto it = range_vec.begin(); it < range_vec.end();) {
                         ranges_to_stream.push_back(*it);
                         ++it;
-                        auto fraction = _db.local().get_config().stream_plan_ranges_fraction();
+                        auto fraction = _stream_plan_ranges_fraction;
                         size_t nr_ranges_per_stream_plan = nr_ranges_total * fraction;
                         if (ranges_to_stream.size() < nr_ranges_per_stream_plan) {
                             continue;

@@ -73,6 +73,7 @@
 #include <seastar/core/shared_ptr_incomplete.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/memory_diagnostics.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/util/file.hh>
 
 #include "locator/abstract_replication_strategy.hh"
@@ -964,6 +965,7 @@ database::init_logstor() {
             .base_dir = std::filesystem::path(_cfg.logstor_directory()),
             .file_size = _cfg.logstor_file_size_in_mb() * 1024ull * 1024ull,
             .disk_size = _cfg.logstor_disk_size_in_mb() * 1024ull * 1024ull,
+            .format_on_startup = _cfg.logstor_format_on_startup(),
             .compaction_sg = _dbcfg.compaction_scheduling_group,
             .compaction_static_shares = _cfg.compaction_static_shares,
             .separator_sg = _dbcfg.memtable_scheduling_group,
@@ -1054,14 +1056,21 @@ void database::drop_keyspace(const sstring& name) {
     _keyspaces.erase(name);
 }
 
+static bool is_system_table(std::string_view ks_name) {
+    return ks_name == db::system_keyspace::NAME ||
+        ks_name == db::system_distributed_keyspace::NAME;
+}
+
 static bool is_system_table(const schema& s) {
-    auto& k = s.ks_name();
-    return k == db::system_keyspace::NAME ||
-        k == db::system_distributed_keyspace::NAME;
+    return is_system_table(s.ks_name());
 }
 
 sstables::sstables_manager& database::get_sstables_manager(const schema& s) const {
-    return get_sstables_manager(system_keyspace(is_system_table(s)));
+    return get_sstables_manager(s.ks_name());
+}
+
+sstables::sstables_manager& database::get_sstables_manager(std::string_view ks_name) const {
+    return get_sstables_manager(system_keyspace(is_system_table(ks_name)));
 }
 
 void database::init_schema_commitlog() {
@@ -3057,26 +3066,26 @@ size_t database::get_logstor_memory_usage() const {
     return m;
 }
 
-future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id uuid, sstring tag, db::snapshot_options opts) {
+future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id uuid, sstring tag, db::snapshot_options opts, snapshot_callback ssc) {
     if (!opts.skip_flush) {
         co_await flush_table_on_all_shards(sharded_db, uuid);
     }
     auto table_shards = co_await get_table_on_all_shards(sharded_db, uuid);
-    co_await snapshot_table_on_all_shards(sharded_db, table_shards, tag, opts);
+    co_await snapshot_table_on_all_shards(sharded_db, table_shards, tag, opts, ssc);
 }
 
-future<> database::snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, db::snapshot_options opts) {
-    return parallel_for_each(table_names, [&sharded_db, ks_name, tag = std::move(tag), opts] (auto& table_name) {
+future<> database::snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, db::snapshot_options opts, snapshot_callback ssc) {
+    return parallel_for_each(table_names, [&sharded_db, ks_name, tag = std::move(tag), opts, &ssc] (auto& table_name) {
         auto uuid = sharded_db.local().find_uuid(ks_name, table_name);
-        return snapshot_table_on_all_shards(sharded_db, uuid, tag, opts);
+        return snapshot_table_on_all_shards(sharded_db, uuid, tag, opts, ssc);
     });
 }
 
-future<> database::snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, db::snapshot_options opts) {
+future<> database::snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, db::snapshot_options opts, snapshot_callback ssc) {
     auto& ks = sharded_db.local().find_keyspace(ks_name);
     co_await coroutine::parallel_for_each(ks.metadata()->cf_meta_data(), [&, tag = std::move(tag), opts] (const auto& pair) -> future<> {
         auto uuid = pair.second->id();
-        co_await snapshot_table_on_all_shards(sharded_db, uuid, tag, opts);
+        co_await snapshot_table_on_all_shards(sharded_db, uuid, tag, opts, ssc);
     });
 }
 
@@ -3335,6 +3344,38 @@ future<std::unordered_map<sstring, database::snapshot_details>> database::get_sn
     }
 
     co_return details;
+}
+
+future<std::optional<std::filesystem::path>> database::find_snapshot_dir(sstring ks_name, sstring table_name, sstring tag) {
+    // The table may have been dropped (and possibly recreated) after the
+    // snapshot was taken. Its data directory '<keyspace>/<table>-<uuid>' is kept
+    // on disk as long as it holds snapshots, so scan for a '<table>-<uuid>'
+    // directory that contains 'snapshots/<tag>' and return the first match.
+    auto table_dir_prefix = get_snapshot_table_dir_prefix(table_name);
+    for (const auto& datadir : _cfg.data_file_directories()) {
+        auto ks_dir = fs::path(datadir) / ks_name;
+        if (!co_await file_exists(ks_dir.native())) {
+            continue;
+        }
+        auto table_dir_lister = directory_lister(ks_dir, lister::dir_entry_types::of<directory_entry_type::directory>(),
+                lister::filter_type([&table_dir_prefix] (const fs::path&, const directory_entry& de) {
+                    return de.name.starts_with(table_dir_prefix);
+                }));
+        auto snapshot_dir = co_await with_closeable(std::move(table_dir_lister), [&] (directory_lister& lister) -> future<std::optional<fs::path>> {
+            while (auto table_ent = co_await lister.get()) {
+                auto candidate = ks_dir / table_ent->name / sstables::snapshots_dir / tag;
+                auto file_type_opt = co_await engine().file_type(candidate.native(), follow_symlink::no);
+                if (file_type_opt && *file_type_opt == directory_entry_type::directory) {
+                    co_return candidate;
+                }
+            }
+            co_return std::nullopt;
+        });
+        if (snapshot_dir) {
+            co_return snapshot_dir;
+        }
+    }
+    co_return std::nullopt;
 }
 
 // For the filesystem operations, this code will assume that all keyspaces are visible in all shards

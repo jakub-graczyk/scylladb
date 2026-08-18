@@ -101,6 +101,7 @@ future<scheduling_groups> get_scheduling_groups() {
         _scheduling_groups->memtable_scheduling_group = co_await create_scheduling_group("memtable", 1000);
         _scheduling_groups->memtable_to_cache_scheduling_group = co_await create_scheduling_group("memtable_to_cache", 200);
         _scheduling_groups->gossip_scheduling_group = co_await create_scheduling_group("gossip", 1000);
+        _scheduling_groups->backup_scheduling_group = co_await create_scheduling_group("backup", 200);
     }
     co_return *_scheduling_groups;
 }
@@ -221,6 +222,7 @@ private:
         return cql3::dialect{
             .duplicate_bind_variable_names_refer_to_same_variable = _db.local().get_config().cql_duplicate_bind_variable_names_refer_to_same_variable(),
             .max_relations_in_where_clause = _db.local().get_config().max_relations_in_where_clause(),
+            .in_bind_variable_name_uses_uppercase_operator = _db.local().get_config().cql_in_bind_variable_name_uses_uppercase_operator(),
         };
     }
 
@@ -422,6 +424,10 @@ public:
         return _proxy;
     }
 
+    virtual sharded<service::paxos::paxos_store>& get_paxos_store() override {
+        return _paxos_store;
+    }
+
     virtual sharded<gms::feature_service>& get_feature_service() override {
         return _feature_service;
     }
@@ -594,6 +600,7 @@ private:
             auto scheduling_groups = get_scheduling_groups().get();
             debug::streaming_scheduling_group = scheduling_groups.streaming_scheduling_group;
             debug::gossip_scheduling_group = scheduling_groups.streaming_scheduling_group;
+            debug::backup_scheduling_group = scheduling_groups.backup_scheduling_group;
 
             auto notify_set = init_configurables
                 ? configurable::init_all(*cfg, init_configurables->extensions, service_set(
@@ -666,6 +673,7 @@ private:
             dbcfg.memtable_scheduling_group = scheduling_groups.memtable_scheduling_group;
             dbcfg.memtable_to_cache_scheduling_group = scheduling_groups.memtable_to_cache_scheduling_group;
             dbcfg.gossip_scheduling_group = scheduling_groups.gossip_scheduling_group;
+            dbcfg.backup_scheduling_group = scheduling_groups.backup_scheduling_group;
 
             auto get_tm_cfg = sharded_parameter([&] {
                 return tasks::task_manager::config {
@@ -983,7 +991,7 @@ private:
                 _view_builder.stop().get();
             });
 
-            _stream_manager.start(std::ref(*cfg), std::ref(_db), std::ref(_view_builder), std::ref(_view_building_worker), std::ref(_ms), std::ref(_mm), std::ref(_gossiper), scheduling_groups.streaming_scheduling_group).get();
+            _stream_manager.start(std::ref(*cfg), std::ref(_db), std::ref(_view_builder), std::ref(_view_building_worker), std::ref(_ms), std::ref(_mm), std::ref(_gossiper), scheduling_groups.streaming_scheduling_group, scheduling_groups.backup_scheduling_group).get();
             auto stop_streaming = defer_verbose_shutdown("stream manager", [this] { _stream_manager.stop().get(); });
 
             _auth_cache.start(std::ref(_qp), std::ref(abort_sources)).get();
@@ -1306,7 +1314,7 @@ public:
             local_qp().get_cql_stats());
         auto qs = make_query_state();
         auto& lqo = *qo;
-        return local_qp().execute_batch_without_checking_exception_message(batch, *qs, lqo, {}).then([qs, batch, qo = std::move(qo)] (auto msg) {
+        return local_qp().execute_batch_without_checking_exception_message(batch, *qs, lqo, batch->get_statements().size(), {}).then([qs, batch, qo = std::move(qo)] (auto msg) {
             return cql_transport::messages::propagate_exception_as_future(std::move(msg));
         });
     }

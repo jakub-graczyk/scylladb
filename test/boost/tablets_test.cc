@@ -2124,6 +2124,9 @@ future<> apply_plan(token_metadata& tm, const migration_plan& plan, service::top
     if (auto request_id = plan.rack_list_colocation_plan().request_to_resume(); request_id) {
         topology.paused_rf_change_requests.erase(request_id);
     }
+    if (const auto& failure = plan.rack_list_colocation_plan().request_to_fail(); failure) {
+        topology.paused_rf_change_requests.erase(failure->request_id);
+    }
     co_await apply_repair_transitions(tm, plan);
 }
 
@@ -2764,6 +2767,7 @@ SEASTAR_THREAD_TEST_CASE(test_rack_list_conversion) {
         e.execute_cql(format("INSERT INTO system.topology_requests (id, request_type, done, new_keyspace_rf_change_ks_name, new_keyspace_rf_change_data) VALUES ({}, 'keyspace_rf_change', False, '{}', {})",
             id, ks_name, rf_change_data_cql)).get();
         auto& stm = e.shared_token_metadata().local();
+        topo.get_shared_load_stats().set_default_tablet_sizes(stm.get());
         auto& talloc = e.get_tablet_allocator().local();
         talloc.set_load_stats(topo.get_load_stats());
         auto& sys_ks = e.get_system_keyspace().local();
@@ -2825,6 +2829,82 @@ SEASTAR_THREAD_TEST_CASE(test_tablet_map_layout) {
         BOOST_REQUIRE(tablet_layout::arbitrary == stm.get()->tablets().get_tablet_map(table1).get_layout());
         return make_ready_future<>();
     }, std::move(cfg)).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_rack_list_conversion_shard_distribution) {
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+
+        unsigned shard_count = 2;
+        auto dc1 = topo.dc();
+        auto rack1 = topo.rack();
+        [[maybe_unused]] auto host1 = topo.add_node(node_state::normal, shard_count);
+        [[maybe_unused]] auto rack2 = topo.start_new_rack();
+        [[maybe_unused]] auto host2 = topo.add_node(node_state::normal, shard_count);
+        auto rack3 = topo.start_new_rack();
+        [[maybe_unused]] auto host3 = topo.add_node(node_state::normal, shard_count);
+
+        auto ks_name = add_keyspace(e, {{dc1, 2}}, 2);
+        auto table1 = add_table(e, ks_name).get();
+
+        // shard         0 1
+        // rack1: host1:
+        // rack2: host2: A B
+        // rack3: host3: B A
+        tablet_id A{0}, B{0};
+        mutate_tablets(e, [&] (tablet_metadata& tmeta) -> future<> {
+            tablet_map tmap(2);
+            auto tid = tmap.first_tablet();
+            A = tid;
+            tmap.set_tablet(tid, tablet_info {  // A
+                tablet_replica_set {
+                    tablet_replica{host2, 0},
+                    tablet_replica{host3, 1},
+                }
+            });
+            tid = *tmap.next_tablet(tid);
+            B = tid;
+            tmap.set_tablet(tid, tablet_info {  // B
+                tablet_replica_set {
+                    tablet_replica{host2, 1},
+                    tablet_replica{host3, 0},
+                }
+            });
+            tmeta.set_tablet_map(table1, std::move(tmap));
+            co_return;
+        });
+
+        auto id = utils::UUID_gen::get_time_UUID();
+        // Build the map literal for CQL
+        auto rf_change_data_cql = format("{{'replication:class': 'NetworkTopologyStrategy', 'replication:{}:0': '{}', 'replication:{}:1': '{}'}}",
+            dc1, rack1.rack, dc1, rack3.rack);
+
+        e.execute_cql(format("INSERT INTO system.topology_requests (id, request_type, done, new_keyspace_rf_change_ks_name, new_keyspace_rf_change_data) VALUES ({}, 'keyspace_rf_change', False, '{}', {})",
+            id, ks_name, rf_change_data_cql)).get();
+        auto& stm = e.shared_token_metadata().local();
+        topo.get_shared_load_stats().set_default_tablet_sizes(stm.get());
+        auto& talloc = e.get_tablet_allocator().local();
+        talloc.set_load_stats(topo.get_load_stats());
+        auto& sys_ks = e.get_system_keyspace().local();
+        auto& topology = e.get_topology_state_machine().local()._topology;
+        topology.paused_rf_change_requests.insert(id);
+        migration_plan plan = talloc.balance_tablets(stm.get(), &topology, &sys_ks).get();
+
+        BOOST_REQUIRE_EQUAL(plan.migrations().size(), 2);
+        // A and B both move host2 -> host1. They must land on different shards
+        // so that host1's shards are loaded evenly. Count migrations per shard.
+        std::unordered_map<shard_id, unsigned> shard_migrations;
+        for (auto& mig : plan.migrations()) {
+            testlog.info("Rack list colocation migration: {}", mig);
+            BOOST_REQUIRE(mig.kind == locator::tablet_transition_kind::migration);
+            BOOST_REQUIRE(mig.src->host == host2);
+            BOOST_REQUIRE(mig.dst->host == host1);
+            shard_migrations[mig.dst->shard] += 1;
+        }
+        // Each of host1's two shards receives exactly one tablet.
+        BOOST_REQUIRE_EQUAL(shard_migrations[0], 1);
+        BOOST_REQUIRE_EQUAL(shard_migrations[1], 1);
+    }).get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_colocation_skipped_on_excluded_nodes) {
@@ -3016,9 +3096,10 @@ SEASTAR_THREAD_TEST_CASE(test_rack_list_conversion_with_two_replicas_in_rack) {
         e.execute_cql(format("INSERT INTO system.topology_requests (id, request_type, done, new_keyspace_rf_change_ks_name, new_keyspace_rf_change_data) VALUES ({}, 'keyspace_rf_change', False, '{}', {})",
             id, ks_name, rf_change_data_cql)).get();
         auto& stm = e.shared_token_metadata().local();
+        topo.get_shared_load_stats().set_default_tablet_sizes(stm.get());
         auto& topology = e.get_topology_state_machine().local()._topology;
         topology.paused_rf_change_requests.insert(id);
-        rebalance_tablets(e);
+        rebalance_tablets(e, &topo.get_shared_load_stats());
         check_rack_list(stm.get()->get_topology(), stm.get()->tablets().get_tablet_map(table1), dc1, {rack1.rack, rack2.rack});
     }).get();
 }
@@ -6712,6 +6793,60 @@ SEASTAR_TEST_CASE(test_cleanup_of_deallocated_tablet) {
             }
         }).get();
         assert(all_tablets);
+    }, cfg);
+}
+
+// Regression test for cleanup failures before the atomic deletion commit point:
+// compacted-but-not-deleted SSTables must stay tracked so cleanup can retry.
+SEASTAR_TEST_CASE(test_tablet_cleanup_retries_compacted_sstable_deletion) {
+    auto cfg = tablet_cql_test_config();
+    cfg.initial_tablets = 1;
+
+    return do_with_cql_env_thread([](cql_test_env& e) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+        fmt::print("Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n");
+        return;
+#endif
+        e.execute_cql("create table ks.cf (pk int, ck int, v text, primary key (pk, ck))").get();
+
+        for (int i = 0; i < 100; i++) {
+            e.execute_cql(format("INSERT INTO ks.cf (pk, ck, v) VALUES ({}, {}, '{}')",
+                                 i, i, "payload_to_ensure_sstable_creation")).get();
+        }
+        replica::database::flush_table_on_all_shards(e.db(), "ks", "cf").get();
+
+        auto saw_failed_cleanup = e.db().map_reduce0([&] (replica::database& db) -> future<bool> {
+            auto& cf = db.find_column_family("ks", "cf");
+            auto& sys_ks = e.get_system_keyspace().local();
+            if (cf.get_stats().tablet_count == 0 || cf.get_sstables()->empty()) {
+                co_return false;
+            }
+
+            utils::get_local_injector().enable("delete_atomically_before_prepare", true);
+            auto disable_injection = seastar::defer([] noexcept {
+                utils::get_local_injector().disable("delete_atomically_before_prepare");
+            });
+            try {
+                co_await cf.cleanup_tablet(db, sys_ks, locator::tablet_id(0));
+                BOOST_FAIL("cleanup_tablet should fail before atomic deletion is committed");
+            } catch (const std::runtime_error& e) {
+                BOOST_REQUIRE_EQUAL(std::string(e.what()), "delete_atomically_before_prepare");
+            }
+
+            BOOST_REQUIRE(cf.tablet_has_compacted_undeleted_sstables(locator::tablet_id(0)));
+            co_return true;
+        }, false, std::logical_or<bool>()).get();
+        BOOST_REQUIRE(saw_failed_cleanup);
+
+        e.db().invoke_on_all([&] (replica::database& db) -> future<> {
+            auto& cf = db.find_column_family("ks", "cf");
+            if (cf.get_stats().tablet_count > 0) {
+                auto& sys_ks = e.get_system_keyspace().local();
+                co_await cf.cleanup_tablet(db, sys_ks, locator::tablet_id(0));
+                BOOST_REQUIRE(!cf.tablet_has_compacted_undeleted_sstables(locator::tablet_id(0)));
+            }
+            co_return;
+        }).get();
     }, cfg);
 }
 

@@ -371,6 +371,12 @@ class ScyllaRESTAPIClient:
     async def message_injection(self, node_ip: str, injection: str) -> None:
         await self.client.post(f"/v2/error_injection/injection/{quote(injection, safe='')}/message", host=node_ip)
 
+    async def get_injection_enter_count(self, node_ip: str, injection: str) -> int:
+        """Return the current enter count for the given injection."""
+        return await self.client.get_json(
+            f"/v2/error_injection/injection/{quote(injection, safe='')}/enters",
+            host=node_ip)
+
     async def wait_for_injection_enter(self, node_ip: str, injection: str, threshold: int = 1, deadline: float | None = None) -> None:
         """Poll until the injection's enter count reaches the threshold.
            Default threshold=1 waits for at least one enter.
@@ -380,9 +386,7 @@ class ScyllaRESTAPIClient:
             deadline = time.time() + 60.0
 
         async def _check():
-            count = await self.client.get_json(
-                f"/v2/error_injection/injection/{quote(injection, safe='')}/enters",
-                host=node_ip)
+            count = await self.get_injection_enter_count(node_ip, injection)
             return count if count >= threshold else None
 
         await wait_for(_check, deadline, label=f"injection_enter({injection})")
@@ -480,6 +484,26 @@ class ScyllaRESTAPIClient:
             **({"kn": keyspace} if keyspace else {}),
         }
         await self.client.delete("/storage_service/snapshots", host=node_ip, params=params)
+
+    async def backup_cluster_snapshot_to_locations(self, node_ip: str, ks: str, snapshot: str, locations: list, tables: list[str] = None) -> str:
+        """Backup cluster snapshot"""
+        params = { 'keyspace': ks,
+                   'snapshot': snapshot,
+        }
+        if tables:
+            params['table'] = ','.join(tables)
+        return await self.client.post_json("/storage_service/tablets/backup", host=node_ip, params=params, json=locations)
+
+    async def backup_cluster_snapshot(self, node_ip: str, ks: str, snapshot: str, datacenter: str, endpoint: str, bucket: str, prefix: str, tables: list[str] = None) -> str:
+        """Backup cluster snapshot"""
+        return await self.backup_cluster_snapshot_to_locations(node_ip, ks, snapshot, [
+            {
+                "datacenter": datacenter,
+                "endpoint": endpoint,
+                "bucket": bucket,
+                "prefix": prefix
+            }
+        ], tables = tables)
 
     async def cleanup_keyspace(self, node_ip: str, ks: str) -> None:
         """Cleanup keyspace"""

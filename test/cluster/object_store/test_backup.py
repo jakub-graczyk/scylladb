@@ -8,14 +8,17 @@ import subprocess
 import tempfile
 import itertools
 import aiohttp
+import codecs
 
 import pytest
 import time
 import random
 
+from typing import Callable, Awaitable
+from functools import partial
 from test.pylib.manager_client import ManagerClient, ServerInfo
-from test.cluster.util import wait_for_cql_and_get_hosts, get_replication, new_test_keyspace
-from test.pylib.rest_client import read_barrier
+from test.cluster.util import wait_for_cql_and_get_hosts, get_replication, new_test_keyspace, new_test_table
+from test.pylib.rest_client import read_barrier, HTTPError
 from test.pylib.util import unique_name, wait_all
 from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas
 from cassandra.cluster import ConsistencyLevel
@@ -24,6 +27,7 @@ from test.pylib.util import wait_for
 from test.pylib.rest_client import HTTPError
 from test.cluster.tasks.task_manager_client import TaskManagerClient
 from test.cluster.util import wait_for_token_ring_and_group0_consistency
+from test.cqlpy import nodetool
 import statistics
 
 logger = logging.getLogger(__name__)
@@ -58,7 +62,6 @@ async def test_simple_backup(manager: ManagerClient, object_storage, move_files)
     objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
            'object_storage_endpoints': objconf,
-           'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
     cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
@@ -104,7 +107,6 @@ async def test_backup_with_non_existing_parameters(manager: ManagerClient, objec
     objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
            'object_storage_endpoints': objconf,
-           'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
     cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
@@ -118,8 +120,15 @@ async def test_backup_with_non_existing_parameters(manager: ManagerClient, objec
         assert len(files) > 0
 
         prefix = f'{cf}/backup'
-        tid = await manager.api.backup(server.ip_addr, ks, cf,
-                backup_snap_name if ne_parameter != 'snapshot' else 'no-such-snapshot',
+        if ne_parameter == 'snapshot':
+            # The snapshot's existence on disk is validated synchronously by the
+            # backup API: the request fails and no task is created.
+            with pytest.raises(HTTPError, match='no-such-snapshot not found'):
+                await manager.api.backup(server.ip_addr, ks, cf, 'no-such-snapshot',
+                        object_storage.address, object_storage.bucket_name, prefix)
+            return
+
+        tid = await manager.api.backup(server.ip_addr, ks, cf, backup_snap_name,
                 object_storage.address if ne_parameter != 'endpoint' else 'no-such-endpoint',
                 object_storage.bucket_name if ne_parameter != 'bucket' else 'no-such-bucket',
                 prefix)
@@ -135,7 +144,6 @@ async def test_backup_endpoint_config_is_live_updateable(manager: ManagerClient,
        after updating the config, it should succeed'''
 
     cfg = {'enable_user_defined_functions': False,
-           'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
     cmd = ['--logger-log-level', 'sstables_manager=debug']
@@ -179,7 +187,6 @@ async def do_test_backup_helper(manager: ManagerClient, object_storage,
     objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
            'object_storage_endpoints': objconf,
-           'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
     cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
@@ -252,7 +259,6 @@ async def test_simple_backup_and_restore(manager: ManagerClient, object_storage,
     objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
            'object_storage_endpoints': objconf,
-           'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
     if do_encrypt:
@@ -365,7 +371,6 @@ async def do_abort_restore(manager: ManagerClient, object_storage):
     objconf = object_storage.create_endpoint_conf()
     config = {'enable_user_defined_functions': False,
               'object_storage_endpoints': objconf,
-              'experimental_features': ['keyspace-storage-options'],
               'task_ttl_in_seconds': 300,
               }
 
@@ -1080,6 +1085,58 @@ async def test_restore_tablets_node_loss_resiliency(build_mode: str, manager: Ma
             # So the best thing to do is to make sure restore task finishes at all
             await asyncio.wait_for(manager.api.wait_task(servers[1].ip_addr, tid), timeout=60)
 
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_restore_tablets_duplicate_after_failed_api_node(build_mode: str, manager: ManagerClient, object_storage):
+    '''Check that a new restore request does not hang after a previous restore failed due to API node loss,
+    and that a subsequent restore of the same table after a *successful* one is actually executed rather than
+    silently skipped.'''
+
+    topology = topo(rf = 2, nodes = 4, racks = 2, dcs = 1)
+    servers, host_ids = await create_cluster(topology, manager, logger, object_storage)
+    log = await manager.server_open_log(servers[0].server_id)
+    await log.wait_for("raft_topology - start topology coordinator fiber", timeout=10)
+
+    await manager.disable_tablet_balancing()
+    cql = manager.get_cql()
+
+    num_keys = 24
+    tablet_count=8
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': {tablet_count}}};")
+        insert_stmt = cql.prepare(f"INSERT INTO {ks}.test (pk, value) VALUES (?, ?)")
+        insert_stmt.consistency_level = ConsistencyLevel.ALL
+        await asyncio.gather(*(cql.run_async(insert_stmt, (str(i), i)) for i in range(num_keys)))
+        snap_name, sstables = await take_snapshot(ks, servers, manager, logger)
+        await asyncio.gather(*(do_backup(s, snap_name, f'{s.server_id}/{snap_name}', ks, 'test', object_storage, manager, logger) for s in servers))
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': {tablet_count}, 'max_tablet_count': {tablet_count}}};")
+
+        await manager.api.enable_injection(servers[1].ip_addr, "pause_tablet_restore", one_shot=True)
+
+        manifests = [ f'{s.server_id}/{snap_name}/manifest.json' for s in servers ]
+        tid = await manager.api.restore_tablets(servers[1].ip_addr, ks, 'test', snap_name, servers[0].datacenter, object_storage.address, object_storage.bucket_name, manifests)
+        await manager.api.wait_for_injection_enter(servers[1].ip_addr, "pause_tablet_restore")
+
+        await manager.server_stop(servers[1].server_id, convict=True)
+        with pytest.raises(aiohttp.client_exceptions.ClientConnectorError):
+            await manager.api.wait_task(servers[1].ip_addr, tid)
+        await log.wait_for("All restore transitions for table .* completed", "Clearing restore transition for .* due to error", timeout=60)
+
+        tid = await manager.api.restore_tablets(servers[3].ip_addr, ks, 'test', snap_name, servers[0].datacenter, object_storage.address, object_storage.bucket_name, manifests)
+        await asyncio.wait_for(manager.api.wait_task(servers[3].ip_addr, tid), timeout=60)
+
+        # The previous restore succeeded. Issue one more restore of the same table/tablets (same gid) and make
+        # sure it actually runs the restore action instead of being silently skipped.
+        mark = await log.mark()
+        tid = await manager.api.restore_tablets(servers[2].ip_addr, ks, 'test', snap_name, servers[0].datacenter, object_storage.address, object_storage.bucket_name, manifests)
+        await asyncio.wait_for(manager.api.wait_task(servers[2].ip_addr, tid), timeout=60)
+        restored = await log.grep("Restoring tablet=", from_mark=mark)
+        assert len(restored) > 0, "Restore was skipped: coordinator reused stale _tablets state and did not restore any tablet"
+
+
 @pytest.mark.parametrize(("min_tablet_count_before_backup", "max_tablet_count_before_backup", "min_tablet_count_before_restore", "max_tablet_count_before_restore"), [
     (1, 1, 2, 2),
     (4, 4, 2, 2),
@@ -1139,7 +1196,6 @@ async def test_restore_with_non_existing_sstable(manager: ManagerClient, object_
     objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
            'object_storage_endpoints': objconf,
-           'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
     cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
@@ -1163,7 +1219,6 @@ async def test_backup_broken_streaming(manager: ManagerClient, s3_storage):
     config = {
         'enable_user_defined_functions': False,
         'object_storage_endpoints': objconf,
-        'experimental_features': ['keyspace-storage-options'],
         'task_ttl_in_seconds': 300,
     }
     cmd = ['--smp', '1', '--logger-log-level', 'sstables_loader=debug:sstable=debug']
@@ -1366,7 +1421,6 @@ async def test_aborted_decommision_reenables_snapshot(manager: ManagerClient, ob
     objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
            'object_storage_endpoints': objconf,
-           'experimental_features': ['keyspace-storage-options'],
            'task_ttl_in_seconds': 300
            }
     cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
@@ -1438,7 +1492,7 @@ async def test_drop_keyspace_during_tablet_restore(manager: ManagerClient, objec
     The fix acquires a stream_in_progress() phaser guard before downloading,
     which makes table::stop() block until the download completes.
     """
-    topology = topo(rf=2, nodes=2, racks=1, dcs=1)
+    topology = topo(rf=2, nodes=2, racks=2, dcs=1)
     servers, host_ids = await create_cluster(topology, manager, logger, object_storage)
     await manager.disable_tablet_balancing()
     cql = manager.get_cql()
@@ -1471,7 +1525,7 @@ async def test_drop_keyspace_during_tablet_restore(manager: ManagerClient, objec
     manifests = [f'{s.server_id}/{snap_name}/manifest.json' for s in servers]
     tid = await manager.api.restore_tablets(servers[0].ip_addr, ks, cf, snap_name, servers[0].datacenter, object_storage.address, object_storage.bucket_name, manifests)
 
-    await server_log.wait_for("pause_download_sstable: waiting for message", from_mark=log_mark)
+    await manager.api.wait_for_injection_enter(servers[1].ip_addr, "pause_download_sstable")
 
     # Issue DROP concurrently — with the fix stream_in_progress() guard blocks
     # table::stop() until download completes; without the fix the data directory
@@ -1482,3 +1536,258 @@ async def test_drop_keyspace_during_tablet_restore(manager: ManagerClient, objec
     await manager.api.message_injection(servers[1].ip_addr, "pause_download_sstable")
 
     await drop_task
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_drop_table_during_backup(manager: ManagerClient, object_storage):
+    """Verify that dropping a table while a native backup is running does not
+    fail the backup.
+    The 'backup_task_before_worker' injection pauses the backup after the
+    snapshot directory has been scanned but before the per-shard worker is
+    constructed. We drop the table while the
+    backup is parked there, then release it and expect the backup to finish.
+    """
+
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'experimental_features': ['keyspace-storage-options'],
+           'task_ttl_in_seconds': 300,
+           }
+    cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
+    server = await manager.server_add(config=cfg, cmdline=cmd)
+    cql = manager.get_cql()
+    cf = 'test_cf'
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( name text primary key, value text );")
+        await asyncio.gather(*(cql.run_async(f"INSERT INTO {ks}.{cf} ( name, value ) VALUES ('{name}', '{value}');") for name, value in [('0', 'zero'), ('1', 'one'), ('2', 'two')]))
+        snap_name, files = await take_snapshot_on_one_server(ks, server, manager, logger)
+        assert len(files) > 0
+
+        # Pause the backup before the per-shard worker runs.
+        await manager.api.enable_injection(server.ip_addr, "backup_task_before_worker", one_shot=True)
+        server_log = await manager.server_open_log(server.server_id)
+        log_mark = await server_log.mark()
+
+        prefix = unique_name('backup_')
+        tid = await manager.api.backup(server.ip_addr, ks, cf, snap_name, object_storage.address, object_storage.bucket_name, prefix)
+
+        await server_log.wait_for("backup_task_before_worker: waiting for message", from_mark=log_mark)
+
+        # Drop the table while the backup is parked. The snapshot files remain on
+        # disk, so the backup should still be able to upload them.
+        await cql.run_async(f"DROP TABLE {ks}.{cf}")
+
+        # Release the backup and let it finish.
+        await manager.api.message_injection(server.ip_addr, "backup_task_before_worker")
+
+        status = await manager.api.wait_task(server.ip_addr, tid)
+        assert status is not None, "Backup task status is missing"
+        assert status['state'] == 'done', f"Backup failed after the table was dropped: {status}"
+
+        # The snapshot's SSTables must have been uploaded to the bucket.
+        objects = set(o.key for o in object_storage.get_resource().Bucket(object_storage.bucket_name).objects.all())
+        for f in files:
+            assert f'{prefix}/{f}' in objects, f"{f} was not uploaded to the backup"
+
+
+@pytest.mark.parametrize("drop", ["table", "keyspace", "table_recreated"])
+async def test_backup_after_schema_dropped(manager: ManagerClient, object_storage, drop):
+    """Verify that a native backup can be started for a snapshot whose table (or
+    whole keyspace) was already dropped before the backup was requested.
+
+    Snapshot files survive DROP TABLE and DROP KEYSPACE: the table's
+    <cf>-<uuid>/snapshots/<name> directory is kept on disk, and the parent
+    keyspace directory is never removed (it stays non-empty because of the
+    surviving snapshot). So the backup should locate the snapshot on disk and
+    complete independent of table existence.
+    """
+
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'experimental_features': ['keyspace-storage-options'],
+           'task_ttl_in_seconds': 300,
+           }
+    cmd = ['--logger-log-level', 'snapshots=trace:task_manager=trace:api=info']
+    server = await manager.server_add(config=cfg, cmdline=cmd)
+    cql = manager.get_cql()
+    cf = 'test_cf'
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( name text primary key, value text );")
+        await asyncio.gather(*(cql.run_async(f"INSERT INTO {ks}.{cf} ( name, value ) VALUES ('{name}', '{value}');") for name, value in [('0', 'zero'), ('1', 'one'), ('2', 'two')]))
+        snap_name, files = await take_snapshot_on_one_server(ks, server, manager, logger)
+        assert len(files) > 0
+
+        # Drop the table/keyspace BEFORE requesting the backup.
+        # The snapshot files remain on disk under <cf>-<uuid>/snapshots/<snap_name>.
+        if drop == "table":
+            await cql.run_async(f"DROP TABLE {ks}.{cf}")
+        elif drop == "keyspace":
+            await cql.run_async(f"DROP KEYSPACE {ks}")
+        else:
+            await cql.run_async(f"DROP TABLE {ks}.{cf}")
+            await cql.run_async(f"CREATE TABLE {ks}.{cf} ( name text primary key, value text );")
+
+        prefix = unique_name('backup_')
+        tid = await manager.api.backup(server.ip_addr, ks, cf, snap_name, object_storage.address, object_storage.bucket_name, prefix)
+
+        status = await manager.api.wait_task(server.ip_addr, tid)
+        assert status is not None, "Backup task status is missing"
+        assert status['state'] == 'done', f"Backup failed for a dropped {drop}'s snapshot: {status}"
+
+        # The snapshot's SSTables must have been uploaded to the bucket.
+        objects = set(o.key for o in object_storage.get_resource().Bucket(object_storage.bucket_name).objects.all())
+        for f in files:
+            assert f'{prefix}/{f}' in objects, f"{f} was not uploaded to the backup"
+
+
+# cluster backup/snapshot
+
+async def prepare_write_workload(cql, table_name, flush=True, n: int = None):
+    """write some data"""
+    keys = list(range(n if n else 100))
+    c1_values = ['value1']
+    c2_values = ['value2']
+
+    statement = cql.prepare(f"INSERT INTO {table_name} (key, c1, c2) VALUES (?, ?, ?)")
+    statement.consistency_level = ConsistencyLevel.ALL
+
+    await asyncio.gather(*[cql.run_async(statement, params) for params in
+                           list(map(lambda x, y, z: [x, y, z], keys,
+                                    itertools.cycle(c1_values),
+                                    itertools.cycle(c2_values)))]
+                                    )
+
+    if flush:
+        await nodetool.flush(cql, table_name)
+
+async def do_test_snapshot_on_all_nodes(manager: ManagerClient,
+                                        handle_snapshot: Callable[[ManagerClient, str, str, str, list[ServerInfo]], Awaitable[None]],
+                                        object_storage = None, 
+                                        do_snapshot: bool = True,
+                                        do_repair: bool = False):
+    """
+    Helper for tests of topology operation snapshot.
+    """
+    topology = topo(rf = 3, nodes = 3, racks = 3, dcs = 1)
+
+    servers, _ = await create_cluster(topology, manager, logger, object_storage)
+
+    snapshot_name = unique_name('snap_')
+
+    async with new_test_keyspace(manager, f"WITH REPLICATION = {{ 'replication_factor' : {topology.rf} }} AND tablets = {{'initial': 20 }}") as ks:
+        async with new_test_table(manager, ks, "key int, c1 text, c2 text, PRIMARY KEY (key)", "") as tbl:
+            cf = tbl.split('.')[1]
+            await prepare_write_workload(manager.get_cql(), tbl, flush=False)
+            if do_repair:
+                await manager.api.repair(servers[0].ip_addr, ks, cf)
+            if do_snapshot:
+                await manager.api.take_cluster_snapshot(servers[0].ip_addr, ks, tag=snapshot_name, tables=[cf])
+            try:
+                await handle_snapshot(manager, snapshot_name, ks, cf, servers)
+            finally:
+                #todo: clear snapshot
+                pass
+
+async def run_cluster_backup(object_storage, prefix: str, manager: ManagerClient, snapshot_name: str, ks: str, cf:str, servers: list[ServerInfo]):
+    """
+    Helper to run a cluster backup
+    """
+    cql = manager.get_cql()
+    s = servers[0]
+
+    backup_tid = await manager.api.backup_cluster_snapshot(s.ip_addr, ks, snapshot_name, s.datacenter, 
+                                                           object_storage.address, object_storage.bucket_name,
+                                                           prefix, tables = [cf])
+
+    backup_status = await manager.api.wait_task(s.ip_addr, backup_tid)
+    assert backup_status is not None and backup_status.get('state') == 'done', "Cluster backup failed"
+
+    snap = list(cql.execute(f"SELECT * FROM system_distributed.snapshots WHERE name = '{snapshot_name}'"))
+    assert len(snap) == 1
+
+    table_id = await manager.get_table_or_view_id(ks, cf)
+
+    objects = set(os.path.basename(o.key) for o in
+                  object_storage.get_resource().Bucket(object_storage.bucket_name).
+                  objects.filter(Prefix=f"{prefix}/sstables"))
+
+    manifest_obj = object_storage.get_resource().Bucket(object_storage.bucket_name).Object(f"{prefix}/snapshots/{snapshot_name}/manifest.json").get()
+    manifest = json.load(manifest_obj['Body'])
+
+    manifest_sstables = [sst['toc_name'] for sst in manifest['sstables']]
+
+    for ss in servers:
+        locations = list(cql.execute(f"SELECT * FROM system_distributed.snapshot_remote_locations WHERE snapshot_name = '{snapshot_name}' AND datacenter = '{s.datacenter}'"))
+        assert len(locations) == 1
+        assert locations[0].state >= 3
+        assert locations[0].endpoint == object_storage.address
+        assert locations[0].bucket == object_storage.bucket_name
+        assert locations[0].prefix == prefix
+
+        sstables = list(cql.execute(f"""
+                    SELECT * FROM system_distributed.snapshot_sstables WHERE 
+                    snapshot_name = '{snapshot_name}' AND \"keyspace\" = '{ks}' AND
+                    \"table\" = '{cf}' AND datacenter = '{ss.datacenter}' AND
+                    rack = '{ss.rack}'
+                    """))
+
+        for sstable in sstables:
+            assert (not sstable.toc_name in manifest_sstables) or sstable.state >= 3
+
+        for sstable in sstables:
+            assert sstable.state < 3 or sstable.toc_name in objects
+            assert sstable.state < 3 or sstable.toc_name in manifest_sstables
+
+    return manifest
+
+@pytest.mark.asyncio
+async def test_cluster_snapshot_backup(manager: ManagerClient, object_storage):
+    """
+    Tests a cluster snapshot can be backed up across cluster, and the files
+    are where we expect
+    """
+    await do_test_snapshot_on_all_nodes(manager, partial(run_cluster_backup, object_storage, 'rapunzel'), object_storage)
+
+@pytest.mark.asyncio
+async def test_cluster_backup_with_auto_snapshot(manager: ManagerClient, object_storage):
+    """
+    Tests a snapshot can be auto generated in backup request
+    """
+    await do_test_snapshot_on_all_nodes(manager, partial(run_cluster_backup, object_storage, 'rapunzel'), object_storage, False)
+
+async def run_double_cluster_backup(object_storage, manager: ManagerClient, snapshot_name: str, ks: str, cf:str, servers: list[ServerInfo]):
+    """
+    Helper
+    """
+    await run_cluster_backup(object_storage, 'ninja1', manager, snapshot_name, ks, cf, servers)
+    await run_cluster_backup(object_storage, 'ninja2', manager, snapshot_name, ks, cf, servers)
+
+@pytest.mark.asyncio
+async def test_cluster_snapshot_backup_to_new_location(manager: ManagerClient, object_storage):
+    """
+    Tests a cluster snapshot can be backed to new location even when already backed up
+    """
+    await do_test_snapshot_on_all_nodes(manager, partial(run_double_cluster_backup, object_storage), object_storage)
+
+
+async def run_cluster_backup_and_check_redundancy(object_storage, manager: ManagerClient, snapshot_name: str, ks: str, cf:str, servers: list[ServerInfo]):
+    """
+    Helper
+    """
+    manifest = await run_cluster_backup(object_storage, 'ninjax', manager, snapshot_name, ks, cf, servers)
+    tablet_to_node = { t['id']: set() for t in manifest['tablets'] }
+    for sst in manifest['sstables']:
+        tablet_to_node[sst['tablet_id']].add(sst['node'])
+
+    for k, nodes in tablet_to_node.items():
+        assert len(nodes) <= 1, f"tablet {k} not pruned"
+
+
+@pytest.mark.asyncio
+async def test_cluster_snapshot_repair_set_unique(manager: ManagerClient, object_storage):
+    """
+    Tests a cluster snapshot reduces the snapshot sstable set by the current repair set for each tablet
+    """
+    await do_test_snapshot_on_all_nodes(manager, partial(run_cluster_backup_and_check_redundancy, object_storage), object_storage, True, True)

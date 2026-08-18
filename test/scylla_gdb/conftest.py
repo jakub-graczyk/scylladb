@@ -31,6 +31,8 @@ def gdb_cmd(scylla_server, request):
         "-q",
         "--batch",
         "--nx",
+        "-iex",
+        "set auto-load safe-path /",
         "-se",
         str(scylla_server.exe),
         "-p",
@@ -41,8 +43,6 @@ def gdb_cmd(scylla_server, request):
         scylla_gdb_py,
         "-x",
         script_py,
-        "-ex",
-        "python gdb.execute('scylla run-all-shards-until-poll')",
     ]
     return cmd
 

@@ -560,6 +560,40 @@ The content is dumped in JSON, using the following schema:
         "dead_rows": Uint64          // dead rows (partition_size records only, 0 otherwise)
     }
 
+.. _scylla-sstable-dump-operation:
+
+dump
+^^^^
+
+Dumps one or more components of the SSTable(s) into a single JSON object per
+SSTable. Useful when you need to inspect multiple components together without
+running separate commands.
+
+The components to dump are selected via ``--components`` (a comma-separated
+list of component names) or ``--all-components`` (to dump all supported
+components). If neither is provided, the command exits with an error.
+
+Supported component names: ``data``, ``index``, ``compression-info``,
+``summary``, ``statistics``, ``scylla-metadata``.
+
+The content is dumped in JSON, using the following schema:
+
+.. code-block:: none
+    :class: hide-copy-button
+
+    $ROOT := { "$sstable_path": $SSTABLE, ... }
+
+    $SSTABLE := {
+        "data":             <same as dump-data $SSTABLE>,             // optional
+        "index":            <same as dump-index $SSTABLE>,            // optional
+        "compression-info": <same as dump-compression-info $SSTABLE>, // optional
+        "summary":          <same as dump-summary $SSTABLE>,          // optional
+        "statistics":       <same as dump-statistics $SSTABLE>,       // optional
+        "scylla-metadata":  <same as dump-scylla-metadata $SSTABLE>   // optional
+    }
+
+Only the requested components appear as keys in the ``$SSTABLE`` object.
+
 dump-schema
 ^^^^^^^^^^^
 
@@ -904,7 +938,7 @@ Similar to ``scylla sstable dump-data --partition|--partition-file``, with some 
 * Also supports negative filters (keep all partitions except the those specified).
 
 The partition list can be provided either via the ``--partition`` command line argument, or via a file path passed to the the ``--partitions-file`` argument. The file should contain one partition key per line.
-Partition keys should be provided in the hex format, as produced by `scylla types serialize </operating-scylla/admin-tools/scylla-types/>`_.
+Partition keys should be provided in the hex format, as produced by :doc:`scylla types serialize </operating-scylla/admin-tools/scylla-types>`.
 
 With ``--include``, only the specified partitions are kept from the input SSTable(s). With ``--exclude``, the specified partitions are discarded and won't be written to the output SSTable(s).
 It is possible that certain input SSTable(s) won't have any content left after the filtering. These input SSTable(s) will not have a matching output SSTable.

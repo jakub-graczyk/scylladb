@@ -725,6 +725,7 @@ raft_tests = set([
     'test/raft/many_test',
     'test/raft/raft_server_test',
     'test/raft/fsm_test',
+    'test/raft/log_indexed_container_test',
     'test/raft/etcd_test',
     'test/raft/raft_sys_table_storage_test',
     'test/raft/discovery_test',
@@ -978,6 +979,7 @@ scylla_core = (['message/messaging_service.cc',
                 'sstables/compress.cc',
                 'sstables/compressor.cc',
                 'sstables/checksummed_data_source.cc',
+                'sstables/digest_checked_data_source.cc',
                 'sstables/sstable_mutation_reader.cc',
                 'compaction/compaction.cc',
                 'compaction/compaction_strategy.cc',
@@ -1034,6 +1036,7 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/functions/castas_fcts.cc',
                 'cql3/functions/error_injection_fcts.cc',
                 'cql3/statements/strong_consistency/modification_statement.cc',
+                'cql3/statements/strong_consistency/batch_statement.cc',
                 'cql3/statements/strong_consistency/select_statement.cc',
                 'cql3/statements/strong_consistency/statement_helpers.cc',
                 'cql3/functions/vector_similarity_fcts.cc',
@@ -1062,8 +1065,6 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/statements/raw/parsed_statement.cc',
                 'cql3/statements/property_definitions.cc',
                 'cql3/statements/update_statement.cc',
-                'cql3/statements/broadcast_modification_statement.cc',
-                'cql3/statements/broadcast_select_statement.cc',
                 'cql3/statements/delete_statement.cc',
                 'cql3/statements/prune_materialized_view_statement.cc',
                 'cql3/statements/batch_statement.cc',
@@ -1165,6 +1166,8 @@ scylla_core = (['message/messaging_service.cc',
                 'db/size_estimates_virtual_reader.cc',
                 'db/snapshot-ctl.cc',
                 'db/snapshot/backup_task.cc',
+                'db/snapshot/manifest.cc',
+                'db/snapshot/cluster_backup.cc',
                 'db/system_distributed_keyspace.cc',
                 'db/system_keyspace.cc',
                 'db/tags/utils.cc',
@@ -1312,6 +1315,7 @@ scylla_core = (['message/messaging_service.cc',
                 'auth/role_or_anonymous.cc',
                 'auth/sasl_challenge.cc',
                 'auth/certificate_authenticator.cc',
+                'auth/certificate_or_password_authenticator.cc',
                 'auth/saslauthd_authenticator.cc',
                 'tracing/tracing.cc',
                 'tracing/trace_keyspace_helper.cc',
@@ -1385,7 +1389,6 @@ scylla_core = (['message/messaging_service.cc',
                 'service/raft/raft_group0.cc',
                 'service/direct_failure_detector/failure_detector.cc',
                 'service/raft/raft_group0_client.cc',
-                'service/broadcast_tables/experimental/lang.cc',
                 'tasks/task_handler.cc',
                 'tasks/task_manager.cc',
                 'rust/wasmtime_bindings/src/lib.rs',
@@ -1514,6 +1517,7 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/group0.idl.hh',
         'idl/hinted_handoff.idl.hh',
         'idl/storage_proxy.idl.hh',
+        'idl/snapshot_backup.idl.hh',
         'idl/sstables.idl.hh',
         'idl/strong_consistency/state_machine.idl.hh',
         'idl/strong_consistency/groups_manager.idl.hh',
@@ -1523,7 +1527,6 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/per_partition_rate_limit_info.idl.hh',
         'idl/position_in_partition.idl.hh',
         'idl/full_position.idl.hh',
-        'idl/experimental/broadcast_tables_lang.idl.hh',
         'idl/storage_service.idl.hh',
         'idl/join_node.idl.hh',
         'idl/utils.idl.hh',
@@ -1658,6 +1661,14 @@ tests_not_using_seastar_test_framework = set([
 
 COVERAGE_INST_FLAGS = ['-fprofile-instr-generate', '-fcoverage-mapping', f'-fprofile-list=./{PROFILES_LIST_FILE_NAME}']
 if args.coverage:
+    # Coverage tracking uses the same branch-counting machinery as PGO, so they don't play nice with each other
+    assert not args.pgo
+    assert not args.cspgo
+    assert not args.use_profile
+    # If args.use_profile is None, a default profile might be used.
+    # With coverage enabled, we want no profile at all, so we explicitly disable any profile use
+    # by setting "".
+    args.use_profile = ""
     for _, mode in filter(lambda m: m[0] != "coverage", modes.items()):
         mode['cxx_ld_flags'] += ' ' + ' '.join(COVERAGE_INST_FLAGS)
         mode['cxx_ld_flags'] = mode['cxx_ld_flags'].strip()
@@ -1709,6 +1720,7 @@ deps['test/boost/combined_tests'] += [
     'test/boost/database_test.cc',
     'test/boost/data_listeners_test.cc',
     'test/boost/disk_space_monitor_test.cc',
+    'test/boost/digest_checked_data_source_test.cc',
     'test/boost/error_injection_test.cc',
     'test/boost/extensions_test.cc',
     'test/boost/filtering_test.cc',
@@ -1726,6 +1738,7 @@ deps['test/boost/combined_tests'] += [
     'test/boost/mutation_reader_test.cc',
     'test/boost/mutation_writer_test.cc',
     'test/boost/network_topology_strategy_test.cc',
+    'test/boost/paxos_state_test.cc',
     'test/boost/per_partition_rate_limit_test.cc',
     'test/boost/pluggable_test.cc',
     'test/boost/querier_cache_test.cc',
@@ -1817,6 +1830,7 @@ deps['test/raft/randomized_nemesis_test'] = ['test/raft/randomized_nemesis_test.
 deps['test/raft/failure_detector_test'] = ['test/raft/failure_detector_test.cc', 'service/direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
 deps['test/raft/many_test'] = ['test/raft/many_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc', 'test/lib/eventually.cc'] + scylla_raft_dependencies
 deps['test/raft/fsm_test'] =  ['test/raft/fsm_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
+deps['test/raft/log_indexed_container_test'] =  ['test/raft/log_indexed_container_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
 deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
 deps['test/raft/raft_sys_table_storage_test'] = ['test/raft/raft_sys_table_storage_test.cc'] + \
     scylla_core + alternator + scylla_tests_generic_dependencies
@@ -2183,7 +2197,12 @@ def configure_seastar(build_dir, mode, mode_config, compiler_cache=None):
     # to seastar/ exists just so any possible DW_AT_name under build (e.g. if there are some generated
     # sources) is excluded from the first rule.
     seastar_build_dir = os.path.join(build_dir, mode, 'seastar')
-    extra_file_prefix_map = f' -ffile-prefix-map={seastar_build_dir}=. -ffile-prefix-map={seastar_build_dir}/=seastar/'
+    # DW_AT_comp_dir records the compiler's working directory as an absolute
+    # path, so the prefix-map must use the absolute build dir to match it.
+    # (build_dir is relative to curdir by default; os.path.join handles the
+    # case where the user passes an absolute --build-dir too.)
+    abs_seastar_build_dir = os.path.join(curdir, seastar_build_dir)
+    extra_file_prefix_map = f' -ffile-prefix-map={abs_seastar_build_dir}=. -ffile-prefix-map={abs_seastar_build_dir}/=seastar/'
     seastar_cmake_args = [
         '-DCMAKE_BUILD_TYPE={}'.format(mode_config['cmake_build_type']),
         '-DCMAKE_C_COMPILER={}'.format(args.cc),
@@ -3054,16 +3073,16 @@ def write_build_file(f,
     for mode in build_modes:
         server_rpms_dir = f'$builddir/dist/{mode}/redhat/RPMS/{arch}'
         server_rpms = [f'{server_rpms_dir}/{scylla_product}{suffix}-{rpm_ver}.{arch}.rpm'
-                       for suffix in ['', '-server', '-server-debuginfo', '-conf', '-kernel-conf', '-node-exporter']]
+                       for suffix in ['', '-server', '-debuginfo', '-conf', '-kernel-conf', '-perf-collector']]
         cqlsh_rpms = [f'tools/cqlsh/build/redhat/RPMS/{arch}/{scylla_product}-cqlsh-{rpm_ver}.{arch}.rpm']
         python3_rpms = [f'tools/python3/build/redhat/RPMS/{arch}/{scylla_product}-python3-{rpm_ver}.{arch}.rpm']
         all_rpms = server_rpms + cqlsh_rpms + python3_rpms
 
         server_deb_dir = f'$builddir/dist/{mode}/debian'
         server_debs = [f'{server_deb_dir}/{scylla_product}{suffix}_{deb_ver}_{deb_arch}.deb'
-                       for suffix in ['', '-server', '-server-dbg', '-conf', '-kernel-conf', '-node-exporter']]
+                       for suffix in ['', '-server', '-server-dbg', '-conf', '-kernel-conf', '-perf-collector']]
         server_debs += [f'{server_deb_dir}/scylla-enterprise{suffix}_{deb_ver}_all.deb'
-                        for suffix in ['', '-server', '-conf', '-kernel-conf', '-node-exporter']]
+                        for suffix in ['', '-server', '-conf', '-kernel-conf']]
         cqlsh_debs = [f'tools/cqlsh/build/debian/{scylla_product}-cqlsh_{deb_ver}_{deb_arch}.deb',
                       f'tools/cqlsh/build/debian/scylla-enterprise-cqlsh_{deb_ver}_all.deb']
         python3_debs = [f'tools/python3/build/debian/{scylla_product}-python3_{deb_ver}_{deb_arch}.deb',

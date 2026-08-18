@@ -124,6 +124,7 @@ enum class sstable_state;
 class sstable;
 class storage_manager;
 class sstables_manager;
+class atomic_deletion;
 class sstable_set;
 class directory_semaphore;
 struct sstable_files_snapshot;
@@ -157,6 +158,8 @@ class large_data_handler;
 class system_table_corrupt_data_handler;
 class nop_corrupt_data_handler;
 class system_keyspace;
+
+struct snapshot_entries;
 
 namespace view {
 class view_update_generator;
@@ -650,6 +653,7 @@ public:
 
     void notify_bootstrap_or_replace_end();
 
+private:
     // Ensures that concurrent preemptible mutations to sstable lists will produce correct results.
     // User will hold this permit until done with all updates. As soon as it's released, another concurrent
     // attempt to update the lists will be able to proceed.
@@ -691,8 +695,13 @@ public:
     };
     // NOTE: Always use this interface for deleting SSTables in the table, since it guarantees
     // synchronization with concurrent iterations.
+    // Returns an object that lets callers control the commit point explicitly:
+    // commit() makes deletion durable, and execute() performs best-effort physical deletion.
+    sstables::atomic_deletion make_atomic_deletion(std::vector<sstables::shared_sstable> sstables_to_remove);
+    // Ignores all errors. Use make_atomic_deletion() for fine-grained error handling.
     future<> delete_sstables_atomically(const sstable_list_permit&, std::vector<sstables::shared_sstable> sstables_to_remove);
 
+public:
     // Precondition: table needs tablet splitting.
     // Returns true if all storage of table is ready for splitting.
     bool all_storage_groups_split();
@@ -1161,6 +1170,8 @@ public:
     const sstables::sstable_set& get_sstable_set() const;
     lw_shared_ptr<const sstable_list> get_sstables() const;
     lw_shared_ptr<const sstable_list> get_sstables_including_compacted_undeleted() const;
+    // For tests only.
+    bool tablet_has_compacted_undeleted_sstables(locator::tablet_id) const;
     std::vector<sstables::shared_sstable> select_sstables(const dht::partition_range& range) const;
     future<> drop_quarantined_sstables();
     size_t sstables_count() const;
@@ -2056,6 +2067,8 @@ public:
     using snapshot_details = db::snapshot_ctl::db_snapshot_details;
     future<std::unordered_map<sstring, snapshot_details>> get_snapshot_details();
 
+    future<std::optional<std::filesystem::path>> find_snapshot_dir(sstring ks_name, sstring table_name, sstring tag);
+
     friend std::ostream& operator<<(std::ostream& out, const database& db);
     const flat_hash_map<sstring, keyspace>& get_keyspaces() const {
         return _keyspaces;
@@ -2098,6 +2111,10 @@ public:
 
     sstables::sstables_manager& get_sstables_manager(const schema& s) const;
 
+    // Selects the sstables_manager by keyspace name alone, so it's possible to
+    // get an sstables manager even if the live table doesnt exist anymore (but its snapshots do).
+    sstables::sstables_manager& get_sstables_manager(std::string_view ks_name) const;
+
     // Returns the list of ranges held by this endpoint
     // The returned list is sorted, and its elements are non overlapping and non wrap-around.
     future<dht::token_range_vector> get_keyspace_local_ranges(locator::static_effective_replication_map_ptr erm);
@@ -2131,9 +2148,11 @@ public:
     static future<> drop_cache_for_table_on_all_shards(sharded<database>& sharded_db, table_id id);
     static future<> drop_cache_for_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name);
 
-    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id id, sstring tag, db::snapshot_options opts);
-    static future<> snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, db::snapshot_options opts);
-    static future<> snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, db::snapshot_options opts);
+    using snapshot_callback = std::function<future<>(const db::snapshot_entries&)>;
+
+    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id id, sstring tag, db::snapshot_options opts, snapshot_callback = {});
+    static future<> snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, db::snapshot_options opts, snapshot_callback = {});
+    static future<> snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, db::snapshot_options opts, snapshot_callback = {});
 
     db::snapshot_ctl* get_snapshot_ctl_ptr() {
         return _snapshot_ctl;
@@ -2145,7 +2164,7 @@ private:
     keyspace::config make_keyspace_config(const keyspace_metadata& ksm, system_keyspace is_system);
     struct table_truncate_state;
 
-    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, const global_table_ptr& table_shards, sstring name, db::snapshot_options opts);
+    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, const global_table_ptr& table_shards, sstring name, db::snapshot_options opts, snapshot_callback = {});
     static future<> truncate_table_on_all_shards(sharded<database>& db, sharded<db::system_keyspace>& sys_ks, const global_table_ptr&, std::optional<db_clock::time_point> truncated_at_opt, bool with_snapshot, std::optional<sstring> snapshot_name_opt);
     future<> truncate(db::system_keyspace& sys_ks, column_family& cf, std::vector<lw_shared_ptr<replica::table>>& views, const table_truncate_state&);
 public:

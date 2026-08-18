@@ -9,15 +9,15 @@
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 import ssl
 import tempfile
-import urllib.parse
 from concurrent.futures.thread import ThreadPoolExecutor
 from multiprocessing import Event
 from pathlib import Path
 from typing import TYPE_CHECKING
 from test import TOP_SRC_DIR, MODES_TIMEOUT_FACTOR, path_to
-from test.pylib.runner import PHASE_REPORT_KEY
+from test.pylib.runner import PHASE_REPORT_KEY, MANAGER_LOGS_KEY, make_failed_test_dir
 from test.cluster.object_store.conftest import make_object_storage
 from test.pylib.random_tables import RandomTables
 from test.pylib.skip_types import skip_env
@@ -48,8 +48,7 @@ if TYPE_CHECKING:
     from cassandra.connection import EndPoint
 
     from test.pylib.internal_types import IPAddress
-    from test.pylib.pool import Pool
-    from test.pylib.scylla_cluster import ScyllaCluster
+    from test.pylib.scylla_cluster import ClusterFactory
 
 
 Session.run_async = run_async     # patch Session for convenience
@@ -79,9 +78,6 @@ def pytest_addoption(parser):
     add_s3_options(parser)
     parser.addoption('--skip-internet-dependent-tests', action='store_true', default=False,
                      help='Skip tests which depend on artifacts from the internet')
-    parser.addoption('--artifacts_dir_url', action='store', type=str, default=None, dest='artifacts_dir_url',
-                     help='Provide the URL to artifacts directory to generate the link to failed tests directory '
-                          'with logs')
 
 
 conn_logger = logging.getLogger("conn_messages")
@@ -161,7 +157,7 @@ def cluster_con(hosts: list[IPAddress | EndPoint], port: int = 9042, use_ssl: bo
 
 @pytest.fixture(scope="module")
 async def manager_api_sock_path(suite_log_dir: Path,
-                                testpy_suite_clusters: Pool[ScyllaCluster],
+                                testpy_cluster_factory: ClusterFactory,
                                 testpy_uname: str) -> AsyncGenerator[str]:
     sock_path = f"{tempfile.mkdtemp(prefix='manager-', dir='/tmp')}/api"
 
@@ -171,11 +167,17 @@ async def manager_api_sock_path(suite_log_dir: Path,
     async def run_manager() -> None:
         mgr = ScyllaClusterManager(
             test_uname=testpy_uname,
-            clusters=testpy_suite_clusters,
+            create_cluster=testpy_cluster_factory,
             base_dir=str(suite_log_dir),
             sock_path=sock_path,
         )
-        await mgr.start()
+        try:
+            await mgr.start()
+        except BaseException:
+            # Dispose of a partially started manager, e.g. a cluster
+            # created before the API site failed to start.
+            await mgr.stop()
+            raise
         start_event.set()
         try:
             await asyncio.get_running_loop().run_in_executor(None, stop_event.wait)
@@ -183,7 +185,15 @@ async def manager_api_sock_path(suite_log_dir: Path,
             await mgr.stop()
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(asyncio.run, run_manager())
+        # Wake up also when the manager dies before signaling readiness
+        # (e.g. cluster creation failed) instead of waiting forever.
+        # The callback fires only after the future is done, so a
+        # completed future here always means a startup failure.
+        future.add_done_callback(lambda _: start_event.set())
         start_event.wait()
+        if future.done():
+            future.result()  # propagate the startup failure
+            raise RuntimeError("ScyllaClusterManager exited before signaling readiness")
 
         yield sock_path
 
@@ -218,7 +228,6 @@ async def manager_internal(request: pytest.FixtureRequest, manager_api_sock_path
 @pytest.fixture(scope="function")
 async def manager(request: pytest.FixtureRequest,
                   manager_internal: Callable[[], ManagerClient],
-                  record_property: Callable[[str, object], None],
                   suite_log_dir: Path,
                   testpy_uname: str,
                   build_mode: str) -> AsyncGenerator[ManagerClient]:
@@ -226,12 +235,32 @@ async def manager(request: pytest.FixtureRequest,
     Per test fixture to notify Manager client object when tests begin so it can perform checks for cluster state.
     """
     test_case_name = request.node.name
-    test_log = suite_log_dir / f"{Path(testpy_uname).stem}.{test_case_name}.log"
     # this should be consistent with scylla_cluster.py handler name in _before_test method
-    test_py_log_test = suite_log_dir / f"{test_log.stem}_cluster.log"
+    test_py_log_test = suite_log_dir / f"{Path(testpy_uname).stem}.{test_case_name}_cluster.log"
 
     manager_client = manager_internal()  # set up client object in fixture with scope function
-    await manager_client.before_test(test_case_name, test_log)
+    logger.debug("before_test for %s", test_case_name)
+    if await manager_client.is_dirty():
+        manager_client.driver_close()  # Close driver connection to old cluster
+    try:
+        cluster_str = await manager_client.client.put_json(f"/cluster/before-test/{test_case_name}", timeout=600,
+                                                           response_type="json")
+        logger.info(f"Using cluster: {cluster_str} for test {test_case_name}")
+    except aiohttp.ClientError as exc:
+        raise RuntimeError(f"Failed before test check {exc}") from exc
+    servers = await manager_client.running_servers()
+    if manager_client.cql is None and servers:
+        await manager_client.driver_connect()  # Connect driver to new cluster
+
+    # Publish what pytest_runtest_makereport needs to attach this test's logs on
+    # failure (single source of truth), so it doesn't re-derive these paths.
+    # The pytest session log is not listed here: it is written per xdist worker
+    # (see PYTEST_LOG_FILE in test/pylib/runner.py) and is already linked from the
+    # failed test's properties by record_failed_test_artifacts().
+    request.node.stash[MANAGER_LOGS_KEY] = {
+        "client": manager_client,
+        "logs": {"test_py.log": test_py_log_test},
+    }
     yield manager_client
     # `request.node.stash` contains reports stored per phase in `pytest_runtest_makereport`
     # from where we can retrieve test failure.
@@ -248,29 +277,22 @@ async def manager(request: pytest.FixtureRequest,
         found_errors = await manager_client.check_all_errors(check_all_errors=(request.node.get_closest_marker("check_nodes_for_errors") is not None))
 
         if failed or found_errors:
-            # Save scylladb logs for failed tests in a separate directory and copy XML report to the same directory to have
-            # all related logs in one dir.
-            # Then add property to the XML report with the path to the directory, so it can be visible in Jenkins
-            failed_test_dir_path = suite_log_dir / "failed_test" / test_case_name.translate(
-                str.maketrans('[]', '()'))
-            failed_test_dir_path.mkdir(parents=True, exist_ok=True)
+            # Server logs / traceback / links are attached by pytest_runtest_makereport;
+            # here we only need the dir for the manager-specific found_errors files below.
+            failed_test_dir_path = make_failed_test_dir(request.config, build_mode, test_case_name)
 
-        if failed:
-            await manager_client.gather_related_logs(
-                failed_test_dir_path,
-                {'pytest.log': test_log, 'test_py.log': test_py_log_test}
-            )
-            with open(failed_test_dir_path / "stacktrace.txt", "w") as f:
-                f.write(call_report.longreprtext)
-            if request.config.getoption('artifacts_dir_url') is not None:
-                # get the relative path to the tmpdir for the failed directory
-                dir_path_relative = f"{failed_test_dir_path.as_posix()[failed_test_dir_path.as_posix().find('testlog'):]}"
-                full_url = urllib.parse.urljoin(request.config.getoption('artifacts_dir_url') + '/',
-                                                urllib.parse.quote(dir_path_relative))
-                record_property("TEST_LOGS", full_url)
-
-        cluster_status = await manager_client.after_test(test_case_name, not failed)
+        # Tear down (after test): notify the Manager server that the test finished
+        # We grab the raw per-loop client here because the `client` property becomes inaccessible
+        # once test_finished_event is set.
+        manager_client.test_finished_event.set()
+        _client = manager_client.client_for_asyncio_loop.get(asyncio.get_running_loop())
+        logger.debug("after_test for %s (success: %s)", test_case_name, not failed)
+        cluster_status = await _client.put_json(f"/cluster/after-test/{not failed}", response_type="json")
+        logger.info("Cluster after test %s (success: %s): %s", test_case_name, not failed, cluster_status)
     finally:
+        # Drop the stash entry before closing the client so a teardown-phase
+        # failure report doesn't gather logs through a stopped client.
+        request.node.stash[MANAGER_LOGS_KEY] = None
         await manager_client.stop()  # Stop client session and close driver after each test
 
     if cluster_status is not None and cluster_status["server_broken"] and not failed:

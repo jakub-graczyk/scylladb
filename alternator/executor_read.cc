@@ -354,6 +354,7 @@ filter::filter(parsed::expression_cache& parsed_expression_cache, const rjson::v
             resolve_condition_expression(parsed,
                     expression_attribute_names, expression_attribute_values,
                     used_attribute_names, used_attribute_values);
+            validate_filter_expression(parsed);
             _imp = expression_filter { std::move(parsed) };
         } catch(expressions_syntax_error& e) {
             throw api_error::validation(e.what());
@@ -1308,6 +1309,254 @@ static std::vector<float> parse_vector(const rjson::value& value, int dimensions
     return out;
 }
 
+// Converts a DynamoDB typed value (e.g. {"S": "hello"} or {"N": "42"}) to a
+// JSON value in the format expected by the vector store pre-filter.
+// If cdef is non-null, the value's DynamoDB type tag must match the declared
+// type of the column; a mismatch triggers a ValidationException.  When cdef
+// is null (e.g. for projected non-key columns whose type is not declared),
+// the type check is skipped.  Only the types S (string) and N (number) are
+// supported; any other type (L, M, SS, NS, BS, BOOL, NULL, B, ...) triggers
+// a ValidationException.
+static rjson::value value_to_prefilter_json(const rjson::value& value, const column_definition* cdef) {
+    if (!value.IsObject() || value.MemberCount() != 1) {
+        throw api_error::validation(
+            "value in VectorSearch KeyConditionExpression must be a typed DynamoDB value");
+    }
+    auto it = value.MemberBegin();
+    std::string_view type_tag = rjson::to_string_view(it->name);
+    const rjson::value& inner = it->value;
+    if (cdef) {
+        std::string expected_type = type_to_string(cdef->type);
+        if (type_tag != expected_type) {
+            throw api_error::validation(fmt::format(
+                "Type mismatch in VectorSearch KeyConditionExpression: "
+                "expected type {} for attribute {}, got type {}",
+                expected_type, cdef->name_as_text(), type_tag));
+        }
+    }
+    if (type_tag == "S") {
+        if (!inner.IsString()) {
+            throw api_error::validation("S type value must be a string");
+        }
+        return rjson::copy(inner);
+    } else if (type_tag == "N") {
+        if (!inner.IsString()) {
+            throw api_error::validation("N type value must be a string");
+        }
+        // Return the number string as-is to preserve full "decimal" type
+        // precision and range, not 64-bit double. The vector store will
+        // parse this string as BigDecimal.
+        return rjson::copy(inner);
+    }
+    throw api_error::validation(format(
+        "Type '{}' is not supported in VectorSearch KeyConditionExpression; "
+        "only S (string) and N (number) are supported", type_tag));
+}
+
+// Converts a single primitive condition from a parsed KeyConditionExpression
+// to vector store pre-filter JSON restriction(s), appended to restrictions_arr.
+// projected_cols maps projected attribute names to their column definitions;
+// any attribute not in this map triggers a ValidationException.
+static void primitive_condition_to_prefilter(
+        const parsed::primitive_condition& cond,
+        const std::unordered_map<std::string, const column_definition*>& projected_cols,
+        rjson::value& restrictions_arr)
+{
+    using ctype = parsed::primitive_condition::type;
+
+    // Return the column_definition for a parsed::value that must be a top-level
+    // attribute path referencing a projected column.
+    auto require_projected_col = [&](const parsed::value& v) -> const column_definition& {
+        const parsed::path& path = std::get<parsed::path>(v._value);
+        if (path.has_operators()) {
+            throw api_error::validation(
+                "VectorSearch KeyConditionExpression does not support nested attribute paths");
+        }
+        auto it = projected_cols.find(path.root());
+        if (it == projected_cols.end()) {
+            throw api_error::validation(format(
+                "VectorSearch KeyConditionExpression references attribute '{}' which is not a projected "
+                "attribute of the vector index; only projected attributes can "
+                "be used for pre-filtering", path.root()));
+        }
+        return *it->second;
+    };
+
+    // Extract the resolved DynamoDB JSON value from a parsed::constant literal.
+    auto require_resolved_val = [](const parsed::value& v) -> const rjson::value& {
+        if (!v.is_constant()) {
+            throw api_error::validation(
+                "value in VectorSearch KeyConditionExpression must be a constant");
+        }
+        const parsed::constant& c = std::get<parsed::constant>(v._value);
+        // We're after resolve_condition_expression(), so only literals remain
+        // not ":name" references.
+        throwing_assert(std::holds_alternative<parsed::constant::literal>(c._value));
+        return *std::get<parsed::constant::literal>(c._value);
+    };
+
+    if (cond._op == ctype::EQ || cond._op == ctype::LT || cond._op == ctype::LE ||
+            cond._op == ctype::GT || cond._op == ctype::GE) {
+        // Binary comparison: one operand is a column path, the other a constant.
+        throwing_assert(cond._values.size() == 2);
+        bool col_left = cond._values[0].is_path();
+        bool col_right = cond._values[1].is_path();
+        if ((!col_left && !col_right) || (col_left && col_right)) {
+            throw api_error::validation(
+                "VectorSearch KeyConditionExpression comparison must compare an attribute to a constant");
+        }
+        const parsed::value& col_v   = col_left ? cond._values[0] : cond._values[1];
+        const parsed::value& const_v = col_left ? cond._values[1] : cond._values[0];
+        const column_definition& cdef = require_projected_col(col_v);
+
+        // The vector store only supports comparisons of the form
+        // "col OP const" where the column name is on the left, so we need to
+        // rewrite "const < col" to "col > const", flipping the comparison
+        // direction.
+        const char* op_str;
+        if (col_left) {
+            switch (cond._op) {
+            case ctype::EQ: op_str = "=="; break;
+            case ctype::LT: op_str = "<";  break;
+            case ctype::LE: op_str = "<="; break;
+            case ctype::GT: op_str = ">";  break;
+            case ctype::GE: op_str = ">="; break;
+            // The outer "if" guarantees cond._op is one of EQ/LT/LE/GT/GE;
+            // the default cases below are unreachable by construction.
+            default: on_internal_error(elogger, "can't happen");
+            }
+        } else {
+            switch (cond._op) {
+            case ctype::EQ: op_str = "=="; break;
+            case ctype::LT: op_str = ">";  break; // const < col -> col > const
+            case ctype::LE: op_str = ">="; break; // const <= col -> col >= const
+            case ctype::GT: op_str = "<";  break; // const > col -> col < const
+            case ctype::GE: op_str = "<="; break; // const >= col -> col <= const
+            default: on_internal_error(elogger, "can't happen");
+            }
+        }
+        auto rhs_json = value_to_prefilter_json(require_resolved_val(const_v), &cdef);
+        auto restriction = rjson::empty_object();
+        rjson::add(restriction, "type", rjson::from_string(op_str));
+        rjson::add(restriction, "lhs", rjson::from_string(cdef.name_as_text()));
+        rjson::add(restriction, "rhs", std::move(rhs_json));
+        rjson::push_back(restrictions_arr, std::move(restriction));
+
+    } else if (cond._op == ctype::IN) {
+        // IN operator: first value is the column, the remaining are constants.
+        if (cond._values.empty() || !cond._values[0].is_path()) {
+            throw api_error::validation(
+                "VectorSearch KeyConditionExpression IN must have an attribute name as its first operand");
+        }
+        const column_definition& cdef = require_projected_col(cond._values[0]);
+        auto rhs_arr = rjson::empty_array();
+        for (size_t i = 1; i < cond._values.size(); ++i) {
+            rjson::push_back(rhs_arr, value_to_prefilter_json(
+                    require_resolved_val(cond._values[i]), &cdef));
+        }
+        auto restriction = rjson::empty_object();
+        rjson::add(restriction, "type", rjson::from_string("IN"));
+        rjson::add(restriction, "lhs", rjson::from_string(cdef.name_as_text()));
+        rjson::add(restriction, "rhs", std::move(rhs_arr));
+        rjson::push_back(restrictions_arr, std::move(restriction));
+
+    } else if (cond._op == ctype::BETWEEN) {
+        // a BETWEEN b AND c is expanded to two restrictions: a >= b AND a <= c.
+        if (cond._values.size() != 3 || !cond._values[0].is_path() ||
+                !cond._values[1].is_constant() || !cond._values[2].is_constant()) {
+            throw api_error::validation(
+                "VectorSearch KeyConditionExpression BETWEEN must have an attribute and two constant bounds");
+        }
+        const column_definition& cdef = require_projected_col(cond._values[0]);
+        auto lower_json = value_to_prefilter_json(require_resolved_val(cond._values[1]), &cdef);
+        auto upper_json = value_to_prefilter_json(require_resolved_val(cond._values[2]), &cdef);
+        auto col_json = rjson::from_string(cdef.name_as_text());
+
+        auto restr_ge = rjson::empty_object();
+        rjson::add(restr_ge, "type", rjson::from_string(">="));
+        rjson::add(restr_ge, "lhs", rjson::copy(col_json));
+        rjson::add(restr_ge, "rhs", std::move(lower_json));
+        rjson::push_back(restrictions_arr, std::move(restr_ge));
+
+        auto restr_le = rjson::empty_object();
+        rjson::add(restr_le, "type", rjson::from_string("<="));
+        rjson::add(restr_le, "lhs", std::move(col_json));
+        rjson::add(restr_le, "rhs", std::move(upper_json));
+        rjson::push_back(restrictions_arr, std::move(restr_le));
+
+    } else {
+        throw api_error::validation(
+            "VectorSearch KeyConditionExpression uses an unsupported operator for vector search "
+            "pre-filtering; supported operators are =, <, <=, >, >=, IN, BETWEEN");
+    }
+}
+
+// Parses a KeyConditionExpression from a vector search request and builds a
+// pre-filter JSON object for the vector store (same format as the CQL filter
+// in vector_search/filter.cc). The expression may only reference projected
+// attributes; currently those are the base table's key columns. Returns an
+// empty JSON object if no KeyConditionExpression is present.
+static rjson::value parse_vector_search_prefilter(
+        parsed::expression_cache& parsed_expr_cache,
+        const rjson::value& request,
+        const schema& schema,
+        std::unordered_set<std::string>& used_attribute_names,
+        std::unordered_set<std::string>& used_attribute_values)
+{
+    const rjson::value* key_cond_expr = rjson::find(request, "KeyConditionExpression");
+    if (!key_cond_expr) {
+        return rjson::empty_object();
+    }
+    if (!key_cond_expr->IsString()) {
+        throw api_error::validation("KeyConditionExpression must be a string");
+    }
+    if (key_cond_expr->GetStringLength() == 0) {
+        throw api_error::validation("KeyConditionExpression must not be empty");
+    }
+
+    parsed::condition_expression parsed_expr;
+    try {
+        parsed_expr = parsed_expr_cache.parse_condition_expression(
+                rjson::to_string_view(*key_cond_expr), "KeyConditionExpression");
+    } catch (expressions_syntax_error& e) {
+        throw api_error::validation(e.what());
+    }
+
+    const rjson::value* attr_names  = rjson::find(request, "ExpressionAttributeNames");
+    const rjson::value* attr_values = rjson::find(request, "ExpressionAttributeValues");
+    resolve_condition_expression(parsed_expr, attr_names, attr_values,
+            used_attribute_names, used_attribute_values);
+
+    // Build the map of projected attribute name -> column_definition.
+    // Currently only the base table's key columns are projected.
+    std::unordered_map<std::string, const column_definition*> projected_cols;
+    for (const column_definition& cdef : schema.partition_key_columns()) {
+        projected_cols[cdef.name_as_text()] = &cdef;
+    }
+    for (const column_definition& cdef : schema.clustering_key_columns()) {
+        projected_cols[cdef.name_as_text()] = &cdef;
+    }
+
+    // Flatten the expression into AND-connected primitive conditions.
+    // OR and NOT are rejected by condition_expression_and_list().
+    std::vector<const parsed::primitive_condition*> conditions;
+    condition_expression_and_list(parsed_expr, conditions);
+
+    auto restrictions_arr = rjson::empty_array();
+    for (const parsed::primitive_condition* cond : conditions) {
+        primitive_condition_to_prefilter(*cond, projected_cols, restrictions_arr);
+    }
+
+    if (restrictions_arr.Empty()) {
+        return rjson::empty_object();
+    }
+
+    auto result = rjson::empty_object();
+    rjson::add(result, "restrictions", std::move(restrictions_arr));
+    rjson::add(result, "allow_filtering", rjson::value(true));
+    return result;
+}
+
 // Converts a similarity score (float) to a JSON value. JSON does not support
 // infinite or NaN values, so if the score is infinite (which can happen with
 // the DOT_PRODUCT similarity function on non-normalized vectors) we clamp to
@@ -1334,6 +1583,7 @@ static future<executor::request_return_type> query_vector(
     lw_shared_ptr<alternator::stats> per_table_stats = get_stats_from_schema(proxy, *base_schema);
     per_table_stats->api_operations.query++;
     stats.vector_search.query++;
+    per_table_stats->vector_search.query++;
     tracing::add_alternator_table_name(trace_state, base_schema->cf_name());
     auto mark_latency = [&stats, &per_table_stats, start_time = std::chrono::steady_clock::now()]() {
         auto duration = std::chrono::steady_clock::now() - start_time;
@@ -1403,6 +1653,13 @@ static future<executor::request_return_type> query_vector(
     uint32_t limit = limit_json->GetUint();
     if (limit == 0) {
         co_return api_error::validation("Limit must be greater than 0");
+    }
+    // The maximum limit for vector search matches the CQL constant
+    // max_ann_query_limit in vector_indexed_table_select_statement.
+    static constexpr uint32_t max_vector_search_limit = 1000;
+    if (limit > max_vector_search_limit) {
+        co_return api_error::validation(
+            format("Limit must not be greater than {}", max_vector_search_limit));
     }
 
     // Consistent reads are not supported for vector search, just like GSI.
@@ -1475,9 +1732,19 @@ static future<executor::request_return_type> query_vector(
         co_return api_error::validation(
             "VectorSearch does not support QueryFilter; use FilterExpression instead");
     }
+    // KeyConditions (the old-style API) is not supported for vector search Queries.
+    if (rjson::find(request, "KeyConditions")) {
+        co_return api_error::validation(
+            "VectorSearch does not support KeyConditions; use KeyConditionExpression instead");
+    }
     // FilterExpression: post-filter the vector search results by any attribute.
     filter flt(parsed_expr_cache, request, filter::request_type::QUERY,
                used_attribute_names, used_attribute_values);
+    // KeyConditionExpression: pre-filter sent to the vector store before ANN search.
+    // Only projected attributes (currently key columns) are allowed.
+    rjson::value pre_filter = parse_vector_search_prefilter(
+            parsed_expr_cache, request, *base_schema,
+            used_attribute_names, used_attribute_values);
     const rjson::value* expression_attribute_names = rjson::find(request, "ExpressionAttributeNames");
     verify_all_are_used(expression_attribute_names, used_attribute_names, "ExpressionAttributeNames", "Query");
     const rjson::value* expression_attribute_values = rjson::find(request, "ExpressionAttributeValues");
@@ -1492,7 +1759,6 @@ static future<executor::request_return_type> query_vector(
     // Query the vector store for the approximate nearest neighbors.
     auto timeout = executor::default_timeout();
     abort_on_expiry aoe(timeout);
-    rjson::value pre_filter = rjson::empty_object(); // TODO, implement
     auto pkeys_result = co_await vsc.ann(
             base_schema->ks_name(), std::string(index_name), base_schema,
             std::move(query_vec), limit, pre_filter, aoe.abort_source());
@@ -1502,6 +1768,7 @@ static future<executor::request_return_type> query_vector(
     }
     const std::vector<vector_search::primary_key>& pkeys = pkeys_result.value();
     stats.vector_search.query_items_from_vs += pkeys.size();
+    per_table_stats->vector_search.query_items_from_vs += pkeys.size();
 
     // For SELECT=COUNT with no filter: skip fetching from the base table and
     // just return the count of candidates returned by the vector store.
@@ -1550,6 +1817,7 @@ static future<executor::request_return_type> query_vector(
         auto count = static_cast<int>(items_json.Size());
         rjson::add(response, "Count", rjson::value(count));
         stats.vector_search.query_returned_items += count;
+        per_table_stats->vector_search.query_returned_items += count;
         stats.returned_items += count;
         stats.returned_items_histogram.add(count);
         per_table_stats->returned_items += count;
@@ -1587,6 +1855,7 @@ static future<executor::request_return_type> query_vector(
     // vector store, to preserve vector-distance ordering in the response.
     // FIXME: do this more efficiently with a batched read that preserves ordering.
     stats.vector_search.query_items_from_base_table += pkeys.size();
+    per_table_stats->vector_search.query_items_from_base_table += pkeys.size();
     for (const auto& pkey : pkeys) {
         std::vector<query::clustering_range> bounds{
                 base_schema->clustering_key_size() > 0
@@ -1598,12 +1867,16 @@ static future<executor::request_return_type> query_vector(
                 base_schema->id(), base_schema->version(), partition_slice,
                 proxy.get_max_result_size(partition_slice),
                 query::tombstone_limit(proxy.get_tombstone_limit()));
-        service::storage_proxy::coordinator_query_result qr =
-                co_await proxy.query(base_schema, command,
+        service::storage_proxy::result<service::storage_proxy::coordinator_query_result> rqr =
+                co_await proxy.query_result(base_schema, command,
                         {dht::partition_range(pkey.partition)},
                         db::consistency_level::LOCAL_ONE,
                         service::storage_proxy::coordinator_query_options(
                                 timeout, permit, client_state, trace_state));
+        if (!rqr) {
+            co_return create_api_error_from_coordinators_exception(std::move(rqr).assume_error());
+        }
+        auto qr = std::move(rqr).assume_value();
         auto opt_item = describe_single_item(base_schema, partition_slice,
                 *selection, *qr.query_result, *attrs_to_get);
         if (opt_item && (!flt || flt.check(*opt_item))) {
@@ -1667,6 +1940,7 @@ static future<executor::request_return_type> query_vector(
         auto count = static_cast<int>(items_json.Size());
         rjson::add(response, "Count", rjson::value(count));
         stats.vector_search.query_returned_items += count;
+        per_table_stats->vector_search.query_returned_items += count;
         stats.returned_items += count;
         stats.returned_items_histogram.add(count);
         per_table_stats->returned_items += count;
@@ -1867,10 +2141,14 @@ future<executor::request_return_type> executor::get_item(client_state& client_st
     verify_all_are_used(expression_attribute_names, used_attribute_names, "ExpressionAttributeNames", "GetItem");
     rcu_consumed_capacity_counter add_capacity(request, cl == db::consistency_level::LOCAL_QUORUM);
     co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::SELECT, _stats);
-    service::storage_proxy::coordinator_query_result qr =
-        co_await _proxy.query(
-            schema, std::move(command), std::move(partition_ranges), cl,
-            service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state, trace_state));
+    service::storage_proxy::result<service::storage_proxy::coordinator_query_result> rqr =
+            co_await _proxy.query_result(
+                schema, std::move(command), std::move(partition_ranges), cl,
+                service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state, trace_state));
+    if (!rqr) {
+        co_return create_api_error_from_coordinators_exception(std::move(rqr).assume_error());
+    }
+    auto qr = std::move(rqr).assume_value();
     per_table_stats->api_operations.get_item_latency.mark(std::chrono::steady_clock::now() - start_time);
     _stats.api_operations.get_item_latency.mark(std::chrono::steady_clock::now() - start_time);
     uint64_t rcu_half_units = 0;
@@ -1892,6 +2170,9 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     // the response size, as DynamoDB does.
     _stats.api_operations.batch_get_item++;
     rjson::value& request_items = request["RequestItems"];
+    if (request_items.MemberCount() == 0) {
+        throw api_error::validation("BatchGetItem requires at least one table in RequestItems");
+    }
     auto start_time = std::chrono::steady_clock::now();
     // We need to validate all the parameters before starting any asynchronous
     // query, and fail the entire request on any parse error. So we parse all
@@ -1952,7 +2233,8 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     _stats.api_operations.batch_get_item_histogram.add(batch_size);
     // If we got here, all "requests" are valid, so let's start the
     // requests for the different partitions all in parallel.
-    std::vector<future<std::vector<rjson::value>>> response_futures;
+    using batch_get_item_result = service::storage_proxy::result<std::vector<rjson::value>>;
+    std::vector<future<batch_get_item_result>> response_futures;
     std::vector<uint64_t> consumed_rcu_half_units_per_table(requests.size());
     for (size_t i = 0; i < requests.size(); i++) {
         const table_requests& rs = requests[i];
@@ -1984,11 +2266,18 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
                     per_table_stats->operation_sizes.batch_get_item_op_size_kb.add(bytes_to_kb_ceil(size));
                 }
             };
-            future<std::vector<rjson::value>> f = _proxy.query(rs.schema, std::move(command), std::move(partition_ranges), rs.cl,
-                    service::storage_proxy::coordinator_query_options(executor::default_timeout(), permit, client_state, trace_state)).then(
-                    [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get, item_callback = std::move(item_callback)] (service::storage_proxy::coordinator_query_result qr) mutable {
+            future<batch_get_item_result> f = 
+                    _proxy.query_result(rs.schema, std::move(command), std::move(partition_ranges), rs.cl,
+                        service::storage_proxy::coordinator_query_options(executor::default_timeout(), permit, client_state, trace_state)).then(
+                    [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get, item_callback = std::move(item_callback)] (service::storage_proxy::result<service::storage_proxy::coordinator_query_result> rqr) mutable -> future<batch_get_item_result> {
+                if (!rqr) {
+                    return make_ready_future<batch_get_item_result>(std::move(rqr).as_failure());
+                }
+                auto qr = std::move(rqr).assume_value();
                 utils::get_local_injector().inject("alternator_batch_get_item", [] { throw std::runtime_error("batch_get_item injection"); });
-                return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get), std::move(item_callback));
+                return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get), std::move(item_callback)).then([] (std::vector<rjson::value> result) {
+                    return make_ready_future<batch_get_item_result>(std::move(result));
+                });
             });
             response_futures.push_back(std::move(f));
         }
@@ -1998,6 +2287,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     // In case of full failure (no reads succeeded), an arbitrary error
     // from one of the operations will be returned.
     bool some_succeeded = false;
+    std::optional<exceptions::coordinator_exception_container> query_error;
     std::exception_ptr eptr;
     audit::audit_table_set audited_table_names;
     bool only_audited_tables = true;
@@ -2007,6 +2297,27 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     rjson::add(response, "UnprocessedKeys", rjson::empty_object());
     auto fut_it = response_futures.begin();
     rjson::value consumed_capacity = rjson::empty_array();
+    auto add_unprocessed_keys = [&] (const std::string& table, const auto& cks) {
+        // Read failed on item represented by `cks` key(s), we need to add it to UnprocessedKeys field in reply object.
+        // We create `UnprocessedKeys` object on first failure - multiple items might fail for the same BatchGetItem call.
+        if (!response["UnprocessedKeys"].HasMember(table)) {
+            // Add the table's entry in UnprocessedKeys. Need to copy all the table's parameters from the request except the
+            // Keys field, which we start empty and then build below.
+            rjson::add_with_string_name(response["UnprocessedKeys"], table, rjson::empty_object());
+            rjson::value& unprocessed_item = response["UnprocessedKeys"][table];
+            rjson::value& request_item = request_items[table];
+            for (auto it = request_item.MemberBegin(); it != request_item.MemberEnd(); ++it) {
+                if (it->name != "Keys") {
+                    rjson::add_with_string_name(unprocessed_item,
+                        rjson::to_string_view(it->name), rjson::copy(it->value));
+                }
+            }
+            rjson::add_with_string_name(unprocessed_item, "Keys", rjson::empty_array());
+        }
+        for (auto& ck : cks) {
+            rjson::push_back(response["UnprocessedKeys"][table]["Keys"], std::move(*ck.second));
+        }
+    };
     for (size_t i = 0; i < requests.size(); i++) {
         const table_requests& rs = requests[i];
         std::string table = rs.schema->cf_name();
@@ -2021,7 +2332,18 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
             auto& fut = *fut_it;
             ++fut_it;
             try {
-                std::vector<rjson::value> results = co_await std::move(fut);
+                // The future here (`storage_proxy::result`, which is a `bo::result`) might contain an error as value
+                // or it might contain an exception (which will be rethrown on `co_await` call).
+                // We need to handle both failures in the same way.
+                batch_get_item_result result = co_await std::move(fut);
+                if (!result) {
+                    if (!query_error) {
+                        query_error.emplace(std::move(result).assume_error());
+                    }
+                    add_unprocessed_keys(table, cks);
+                    continue;
+                }
+                std::vector<rjson::value> results = std::move(result).assume_value();
                 some_succeeded = true;
                 if (!response["Responses"].HasMember(table)) {
                     rjson::add_with_string_name(response["Responses"], table, rjson::empty_array());
@@ -2031,26 +2353,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
                 }
             } catch(...) {
                 eptr = std::current_exception();
-                // This read of potentially several rows in one partition,
-                // failed. We need to add the row key(s) to UnprocessedKeys.
-                if (!response["UnprocessedKeys"].HasMember(table)) {
-                    // Add the table's entry in UnprocessedKeys. Need to copy
-                    // all the table's parameters from the request except the
-                    // Keys field, which we start empty and then build below.
-                    rjson::add_with_string_name(response["UnprocessedKeys"], table, rjson::empty_object());
-                    rjson::value& unprocessed_item = response["UnprocessedKeys"][table];
-                    rjson::value& request_item = request_items[table];
-                    for (auto it = request_item.MemberBegin(); it != request_item.MemberEnd(); ++it) {
-                        if (it->name != "Keys") {
-                            rjson::add_with_string_name(unprocessed_item,
-                                rjson::to_string_view(it->name), rjson::copy(it->value));
-                        }
-                    }
-                    rjson::add_with_string_name(unprocessed_item, "Keys", rjson::empty_array());
-                }
-                for (auto& ck : cks) {
-                    rjson::push_back(response["UnprocessedKeys"][table]["Keys"], std::move(*ck.second));
-                }
+                add_unprocessed_keys(table, cks);
             }
         }
         uint64_t rcu_half_units = consumed_rcu_half_units_per_table[i];
@@ -2084,6 +2387,9 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     }
     if (!some_succeeded && eptr) {
         co_await coroutine::return_exception_ptr(std::move(eptr));
+    }
+    if (!some_succeeded && query_error) {
+        co_return create_api_error_from_coordinators_exception(*query_error);
     }
     auto duration = std::chrono::steady_clock::now() - start_time;
     _stats.api_operations.batch_get_item_latency.mark(duration);

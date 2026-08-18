@@ -15,11 +15,11 @@
 #include "dht/token.hh"
 #include "message/messaging_service.hh"
 #include "mutation/canonical_mutation.hh"
+#include "mutation/mutation.hh"
 #include "mutation/async_utils.hh"
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
-#include "service/broadcast_tables/experimental/query_result.hh"
 #include "schema/schema_mutations.hh"
 #include "schema/frozen_schema.hh"
 #include "serialization_visitors.hh"
@@ -29,8 +29,6 @@
 #include "idl/uuid.dist.impl.hh"
 #include "idl/frozen_schema.dist.hh"
 #include "idl/frozen_schema.dist.impl.hh"
-#include "idl/experimental/broadcast_tables_lang.dist.hh"
-#include "idl/experimental/broadcast_tables_lang.dist.impl.hh"
 #include "service/storage_service.hh"
 #include "idl/storage_service.dist.hh"
 #include "idl/group0_state_machine.dist.hh"
@@ -324,9 +322,9 @@ future<> group0_state_machine::merge_and_apply(group0_state_machine_merger& merg
             co_await write_mutations_to_database(_ss, _sp, cmd.creator_addr, std::move(chng.mutations));
         }
     },
-    [&] (broadcast_table_query& query) -> future<> {
-        auto result = co_await service::broadcast_tables::execute_broadcast_table_query(_sp, query.query, cmd.new_state_id);
-        _client.set_query_result(cmd.new_state_id, std::move(result));
+    [] (unused&) -> future<> {
+        slogger.warn("Ignoring unused group0 command");
+        co_return;
     },
     [&] (topology_change& chng) -> future<> {
         modules_to_reload = get_modules_to_reload(chng.mutations);
@@ -382,8 +380,8 @@ static void ensure_group0_schema(const group0_command& cmd, data_dictionary::dat
             [validate_schema](const schema_change& change) {
                 validate_schema(change.mutations);
             },
-            [](const broadcast_table_query&) {
-                // no mutations to validate
+            [](const unused&) {
+                slogger.warn("Ignoring unused group0 command");
             },
             [validate_schema](const topology_change& change) {
                 validate_schema(change.mutations);
@@ -615,6 +613,115 @@ future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::
 future<> group0_state_machine::abort() {
     _abort_source.request_abort();
     return _gate.close();
+}
+
+mutation* group0_update_collector::locate_for_merge(mutation& m) {
+    auto m_size = m.memory_usage(*m.schema());
+    if (m_size >= _max_mutation_size) {
+        _closed_mutations.emplace_back(std::move(m), m_size);
+        return nullptr;
+    }
+
+    auto it = _mutations.find(m);
+    if (it == _mutations.end()) {
+        _mutations.emplace(std::move(m), m_size);
+        return nullptr;
+    }
+    if (it->second + m_size > _max_mutation_size) {
+        // Merging would grow the accumulated mutation past the limit. Seal the larger mutation of the two.
+        if (it->second >= m_size) {
+            auto nh = _mutations.extract(it);
+            _closed_mutations.emplace_back(std::move(nh.key()), nh.mapped());
+            _mutations.emplace(std::move(m), m_size);
+        } else {
+            _closed_mutations.emplace_back(std::move(m), m_size);
+        }
+        return nullptr;
+    }
+    it->second += m_size;
+    return &const_cast<mutation&>(it->first);
+}
+
+future<> group0_update_collector::add(mutation m) {
+    if (m.empty()) {
+        co_return;
+    }
+    ++_change_counter;
+    if (auto* existing = locate_for_merge(m)) {
+        co_await existing->apply_gently(std::move(m));
+    }
+}
+
+void group0_update_collector::add_small(mutation m) {
+    if (m.empty()) {
+        return;
+    }
+    ++_change_counter;
+    if (auto* existing = locate_for_merge(m)) {
+        existing->apply(std::move(m));
+    }
+}
+
+void group0_update_collector::add_large(mutation m) {
+    if (m.empty()) {
+        return;
+    }
+    ++_change_counter;
+    _closed_mutations.emplace_back(std::move(m), m.memory_usage(*m.schema()));
+}
+
+void group0_update_collector::add(utils::chunked_vector<canonical_mutation> muts) {
+    ++_change_counter;
+    for (auto& m : muts) {
+        _frozen_mutations.emplace_back(std::move(m));
+    }
+}
+
+void group0_update_collector::add(canonical_mutation m) {
+    ++_change_counter;
+    _frozen_mutations.emplace_back(std::move(m));
+}
+
+void group0_update_collector::clear() {
+    ++_change_counter;
+    _mutations.clear();
+    _closed_mutations.clear();
+    _frozen_mutations.clear();
+}
+
+future<utils::chunked_vector<canonical_mutation>> group0_update_collector::collect() {
+    utils::chunked_vector<canonical_mutation> result;
+    result.reserve(_closed_mutations.size() + _mutations.size() + _frozen_mutations.size());
+
+    for (auto& [m, m_size] : _closed_mutations) {
+        if (m_size <= _max_mutation_size) {
+            result.emplace_back(co_await make_canonical_mutation_gently(m));
+        } else {
+            // A single mutation can still exceed the limit (e.g. one large add()).
+            // Split it into row-subsets; the pieces are merged back into the same
+            // partition when the command is applied.
+            utils::chunked_vector<mutation> split_mutations;
+            co_await split_mutation(std::move(m), split_mutations, _max_mutation_size);
+            for (auto& sm : split_mutations) {
+                result.emplace_back(co_await make_canonical_mutation_gently(sm));
+            }
+        }
+    }
+    _closed_mutations.clear();
+
+    while (!_mutations.empty()) {
+        auto m = std::move(_mutations.extract(_mutations.begin()).key());
+        result.emplace_back(co_await make_canonical_mutation_gently(m));
+    }
+
+    for (auto& m : _frozen_mutations) {
+        result.emplace_back(std::move(m));
+    }
+    _frozen_mutations.clear();
+
+    ++_change_counter;
+
+    co_return std::move(result);
 }
 
 } // end of namespace service

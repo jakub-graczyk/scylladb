@@ -315,8 +315,8 @@ def run_scylla_cmd(pid, dir):
         # Note that Alternator-specific experimental features are listed in
         # test/alternator/run.
         '--experimental-features=udf',
-        '--experimental-features=keyspace-storage-options',
         '--experimental-features=views-with-tablets',
+        '--experimental-features=logstor',
         '--enable-tablets=true',
         '--enable-user-defined-functions', '1',
         # Views with tablets refuse to work if this option is not on :-(
@@ -341,6 +341,9 @@ def run_scylla_cmd(pid, dir):
         # The expiration scanner's period (started for Alternator but
         # now also CQL)
         '--alternator-ttl-period-in-seconds=0.5',
+        '--logstor-disk-size-in-mb=8',
+        '--logstor-file-size-in-mb=4',
+        '--logstor-separator-max-memory-in-mb=8',
         ], env)
 
 # Same as run_scylla_cmd, just use SSL encryption for the CQL port (same
@@ -393,8 +396,6 @@ def run_precompiled_scylla_cmd(exe, pid, dir):
         cmd.remove('--auth-superuser-salted-password=$6$x7IFjiX5VCpvNiFk$2IfjTvSyGL7zerpV.wbY7mJjaRCrJ/68dtT3UpT.sSmNYz1bPjtn3mH.kJKFvaZ2T4SbVeBijjmwGjcb83LlV/')
     if major <= [5,1] or (enterprise and major <= [2022,2]):
         cmd.remove('--query-tombstone-page-limit=1000')
-    if major <= [5,0] or (enterprise and major <= [2022,1]):
-        cmd.remove('--experimental-features=keyspace-storage-options')
     if major <= [4,5] or (enterprise and major <= [2021,1]):
         cmd.remove('--kernel-page-cache=1')
         cmd.remove('--flush-schema-tables-after-modification=false')
@@ -410,6 +411,11 @@ def run_precompiled_scylla_cmd(exe, pid, dir):
         cmd.remove('--rf-rack-valid-keyspaces=1')
     if major < [2025,2]:
         cmd.remove('--group0-raft-op-timeout-in-ms=300000')
+    if major < [2026,2]:
+        cmd.remove('--experimental-features=logstor')
+        cmd.remove('--logstor-disk-size-in-mb=8')
+        cmd.remove('--logstor-file-size-in-mb=4')
+        cmd.remove('--logstor-separator-max-memory-in-mb=8')
     return (cmd, env)
 
 # Get a Cluster object to connect to CQL at the given IP address (and with
@@ -561,3 +567,23 @@ def setup_ssl_certificate(dir):
     # FIXME: error checking (if "openssl" isn't found, for example)
     os.system(f'openssl genrsa 2048 > "{dir}/scylla.key"')
     os.system(f'openssl req -new -x509 -nodes -sha256 -days 365 -subj "/C=IL/ST=None/L=None/O=None/OU=None/CN=example.com" -key "{dir}/scylla.key" -out "{dir}/scylla.crt"')
+
+# Set up mTLS (mutual TLS) certificates for testing client certificate
+# authentication. Creates:
+#   dir/ca.key, dir/ca.crt    - a self-signed CA certificate
+#   dir/client.key, dir/client.crt - a client certificate with CN "cassandra",
+#                                    signed by the above CA
+# The CA certificate (dir/ca.crt) should be passed to Scylla as the truststore
+# so that Scylla can verify client certificates. The client key and certificate
+# can be used by test clients to authenticate themselves.
+def setup_mtls_certificate(dir):
+    # FIXME: error checking (if "openssl" isn't found, for example)
+    # Create a self-signed CA certificate
+    os.system(f'openssl genrsa 2048 > "{dir}/ca.key"')
+    os.system(f'openssl req -new -x509 -nodes -sha256 -days 365 -subj "/CN=TestCA" -key "{dir}/ca.key" -out "{dir}/ca.crt"')
+    # Create a client key and a certificate signing request with CN "cassandra",
+    # matching the role already used in Alternator tests.
+    os.system(f'openssl genrsa 2048 > "{dir}/client.key"')
+    os.system(f'openssl req -new -sha256 -subj "/CN=cassandra" -key "{dir}/client.key" -out "{dir}/client.csr"')
+    # Sign the client certificate with the CA
+    os.system(f'openssl x509 -req -sha256 -days 365 -in "{dir}/client.csr" -CA "{dir}/ca.crt" -CAkey "{dir}/ca.key" -CAcreateserial -out "{dir}/client.crt"')

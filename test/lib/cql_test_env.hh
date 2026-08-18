@@ -65,6 +65,10 @@ class migration_manager;
 class raft_group0_client;
 class raft_group_registry;
 
+namespace paxos {
+class paxos_store;
+}
+
 }
 
 class not_prepared_exception : public std::runtime_error {
@@ -85,6 +89,7 @@ struct scheduling_groups {
     scheduling_group memtable_scheduling_group;
     scheduling_group memtable_to_cache_scheduling_group;
     scheduling_group gossip_scheduling_group;
+    scheduling_group backup_scheduling_group;
 };
 
 // Creating and destroying scheduling groups on each env setup and teardown
@@ -197,6 +202,8 @@ public:
     virtual sharded<service::tablet_allocator>& get_tablet_allocator() = 0;
 
     virtual sharded<service::storage_proxy>& get_storage_proxy() = 0;
+
+    virtual sharded<service::paxos::paxos_store>& get_paxos_store() = 0;
 
     virtual sharded<gms::feature_service>& get_feature_service() = 0;
 

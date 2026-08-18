@@ -20,8 +20,6 @@ import time
 import socket
 import string
 import math
-import contextlib
-import tempfile
 
 
 def align_up(ptr, alignment):
@@ -899,6 +897,25 @@ class managed_vector:
             yield self._ref['_data'][i]
 
 
+class managed_chunk_directory:
+    def __init__(self, ref):
+        self._ref = ref
+
+    def __len__(self):
+        return int(self._ref['_size'])
+
+    def __nonzero__(self):
+        return self.__len__() > 0
+
+    def __bool__(self):
+        return self.__len__() > 0
+
+    def __iter__(self):
+        for block in managed_vector(self._ref['_blocks']):
+            for chunk in managed_vector(block):
+                yield chunk
+
+
 class chunked_managed_vector:
     def __init__(self, ref):
         self._ref = ref
@@ -913,7 +930,13 @@ class chunked_managed_vector:
         return self.__len__() > 0
 
     def __iter__(self):
-        for chunk in managed_vector(self._ref['_chunks']):
+        chunks = self._ref['_chunks']
+        try:
+            chunks['_blocks']
+            chunk_iter = managed_chunk_directory(chunks)
+        except gdb.error:
+            chunk_iter = managed_vector(chunks)
+        for chunk in chunk_iter:
             for e in managed_vector(chunk):
                 yield e
 
@@ -3705,7 +3728,7 @@ class chunked_vector(object):
         self._max_contiguous_allocation = int(list(template_arguments(self.ref.type))[1])
 
     def max_chunk_capacity(self):
-        return max(self._max_contiguous_allocation / self.ref.type.sizeof, 1);
+        return max(self._max_contiguous_allocation // self.ref.type.template_argument(0).sizeof, 1);
 
     def __len__(self):
         return int(self.ref['_size'])
@@ -4283,7 +4306,9 @@ class scylla_fiber(gdb.Command):
         parser.add_argument("--direction", action="store", choices=['forward', 'backward', 'both'], default='both',
                 help="Direction in which to walk the continuation chain. 'forward' walks futures waiting on the given task,"
                 " 'backward' walks futures the given task is waiting on, 'both' does both.")
-        parser.add_argument("task", action="store", help="An expression that evaluates to a valid `seastar::task*` value. Cannot contain white-space.")
+        parser.add_argument("task", nargs='?', default=None,
+                help="An expression that evaluates to a valid `seastar::task*` value. Cannot contain white-space."
+                " If omitted, the current task of the local engine is used.")
 
         try:
             args = parser.parse_args(arg.split())
@@ -4306,7 +4331,11 @@ class scylla_fiber(gdb.Command):
             if not using_seastar_allocator:
                 gdb.write("Not using the seastar allocator, falling back to scanning a fixed-size region of memory\n")
 
-            initial_task_ptr = int(gdb.parse_and_eval(args.task))
+            if args.task is None:
+                initial_task_ptr = int(gdb.parse_and_eval('seastar::local_engine')['_current_task'])
+            else:
+                initial_task_ptr = int(gdb.parse_and_eval(args.task))
+
             this_task = self._probe_pointer(initial_task_ptr, args.scanned_region_size, using_seastar_allocator, args.verbose)
             if this_task is None:
                 gdb.write("Provided pointer 0x{:016x} is not an object managed by seastar or not a task pointer\n".format(initial_task_ptr))
@@ -4694,8 +4723,14 @@ class scylla_sstables(gdb.Command):
             local = sst['_components']['_cpu'] == cpu_id
             size += sc.dereference().type.sizeof
 
-            bf = std_unique_ptr(sc['filter']).get().cast(filter_type.pointer())
-            bf_size = bf.dereference().type.sizeof + chunked_vector(bf['_bitset']['_storage']).external_memory_footprint()
+            bf_ptr = std_unique_ptr(sc['filter']).get()
+            bf_size = 0
+            # An sstable might its bloom filter initialization delayed until the Data component is finished.
+            if int(bf_ptr) != 0:
+                bf = bf_ptr.dynamic_cast(filter_type.pointer())
+                # An sstable might have its bloom filter evicted, in which case its type is not filter_type.
+                if int(bf) != 0:
+                    bf_size = bf.dereference().type.sizeof + chunked_vector(bf['_bitset']['_storage']).external_memory_footprint()
             size += bf_size
 
             summary_size = std_vector(sc['summary']['_summary_data']).external_memory_footprint()
@@ -5681,7 +5716,7 @@ class scylla_schema(gdb.Command):
 
         gdb.write('\n')
         gdb.write("columns:\n")
-        for cdef in std_vector(raw_schema['_columns']):
+        for cdef in chunked_vector(raw_schema['_columns']):
             gdb.write("    {:27} id={} ordinal_id={} {} {} is_atomic={} is_counter={}\n".format(
                     str(cdef['kind']),
                     cdef['id'],
@@ -6566,57 +6601,6 @@ class scylla_prepared_statements(gdb.Command):
                 else:
                     gdb.write("{}\n".format(val))
 
-@contextlib.contextmanager
-def with_saved_breakpoints():
-    """Saves the current breakpoints, deletes them, and restores them on exit."""
-    had_breakpoints = bool(gdb.breakpoints())
-    if had_breakpoints:
-        with tempfile.NamedTemporaryFile() as breakpoint_file:
-            gdb.execute(f'save breakpoints {breakpoint_file.name}')
-            gdb.execute('delete breakpoints')
-            try:
-                yield
-            finally:
-                gdb.execute(f'source {breakpoint_file.name}')
-    else:
-        try:
-            yield
-        finally:
-            if gdb.breakpoints():
-                gdb.execute('delete breakpoints')
-
-@contextlib.contextmanager
-def with_saved_thread():
-    """Saves the current thread and restores it on exit."""
-    orig = gdb.selected_thread()
-    try:
-        yield
-    finally:
-        orig.switch()
-
-class scylla_run_all_shards_until_poll(gdb.Command):
-    """Advances all reactor threads until a poll point.
-
-    Used for ensuring that gdb tests run in a consistent database state.
-    """
-
-    def __init__(self):
-        gdb.Command.__init__(self, 'scylla run-all-shards-until-poll', gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
-
-    def invoke(self, arg, for_tty):
-        with with_saved_breakpoints():
-            with gdb.with_parameter("scheduler-locking", "on"):
-                with with_saved_thread():
-                    for t in gdb.selected_inferior().threads():
-                        t.switch()
-                        reactor = gdb.parse_and_eval('::seastar::local_engine')
-                        if not reactor:
-                            continue
-                        gdb.execute("tbreak ::seastar::reactor::poll_once")
-                        # If setting the breakpoint fails, gdb only warns...
-                        assert gdb.breakpoints()
-                        gdb.execute("continue")
-
 class scylla_gdb_func_collection_element(gdb.Function):
     """Return the element at the specified index/key from the container.
 
@@ -6823,7 +6807,6 @@ scylla_sstable_promoted_index()
 scylla_sstable_dump_cached_index()
 scylla_tablet_metadata()
 scylla_prepared_statements()
-scylla_run_all_shards_until_poll()
 
 
 # Convenience functions

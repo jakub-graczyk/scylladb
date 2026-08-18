@@ -288,6 +288,69 @@ def test_scylla_sstable_dump_component(cql, test_keyspace, scylla_path, scylla_d
             assert "sharding" in sst_metadata, f"Expected 'sharding' metadata in sstable scylla-metadata: sstable={sst_name}: {sst_metadata}"
             assert sst_metadata["sharding"] != [], f"Expected non-empty sharding metadata in sstable scylla-metadata: sstable={sst_name}: {sst_metadata}"
 
+@pytest.mark.parametrize("components_spec", [
+    None,                           # None -> --all-components
+    ["data"],                       # one component
+    ["index", "summary"],           # two components
+], ids=["all_components", "one_component", "two_components"])
+def test_scylla_sstable_dump(cql, test_keyspace, scylla_path, scylla_data_dir, components_spec):
+    """Test the universal 'dump' command (f20f2aac5f).
+
+    Runs 'dump' for (1) all components, (2) one component, and (3) two
+    components.  For each case the output is compared against the dedicated
+    per-component dump-* commands after stripping the different top-level
+    envelope:
+
+        dump:         {"sstables": {path: {"component": value, ...}}}
+        dump-{comp}:  {"sstables": {path: value}}
+
+    So for every component:
+        dump_out["sstables"][path][comp] == per_comp_out["sstables"][path]
+    """
+    all_components = ["data", "index", "compression-info", "summary", "statistics", "scylla-metadata"]
+    components = all_components if components_spec is None else components_spec
+
+    with scylla_sstable(simple_clustering_table, cql, test_keyspace, scylla_data_dir) as (_, schema_file, sstables):
+        sst = [sstables[0]]  # one sstable keeps the comparison simple
+        schema_args = ["--schema-file", schema_file]
+        base_cmd = [scylla_path, "sstable"]
+
+        # Build the universal dump command.
+        dump_cmd = base_cmd + ["dump"] + schema_args
+        if components_spec is None:
+            dump_cmd += ["--all-components"]
+        else:
+            for c in components:
+                dump_cmd += ["--components", c]
+        dump_cmd += sst
+
+        dump_out = json.loads(subprocess.check_output(dump_cmd))
+        assert "sstables" in dump_out
+        dump_sstables = dump_out["sstables"]
+        assert len(dump_sstables) == 1  # one sstable passed
+        sst_path, sst_dump = next(iter(dump_sstables.items()))
+
+        # Only the requested components should appear – no extras, no missing.
+        assert set(sst_dump.keys()) == set(components)
+
+        # Compare every component value with the dedicated per-component command.
+        for comp in components:
+            if comp == "data":
+                per_comp_out = json.loads(subprocess.check_output(
+                    base_cmd + ["dump-data", "--output-format", "json"] + schema_args + sst
+                ))
+            else:
+                per_comp_out = json.loads(subprocess.check_output(
+                    base_cmd + [f"dump-{comp}"] + schema_args + sst
+                ))
+
+            assert "sstables" in per_comp_out
+            assert sst_path in per_comp_out["sstables"], \
+                f"sstable path '{sst_path}' not found in dump-{comp} output"
+            assert sst_dump[comp] == per_comp_out["sstables"][sst_path], \
+                f"Component '{comp}' value differs between 'dump' and 'dump-{comp}'"
+
+
 @pytest.mark.parametrize("table_factory", [
         simple_no_clustering_table,
         simple_clustering_table,
@@ -1563,6 +1626,35 @@ def test_scylla_sstable_shard_of_tablets(cql, test_keyspace_tablets, scylla_path
                     for replica_set in replica_sets:
                         actual_shard = replica_set['shard']
                         assert actual_shard == shard_id
+
+
+def test_scylla_sstable_shard_of_tablets_with_stale_directory(cql, test_keyspace_tablets, scylla_path, scylla_data_dir) -> None:
+    """Regression test for #27006: shard-of must use the table ID from the SSTable path."""
+    key = 0  # mapped to shard 0
+
+    def table_with_stale_directory(cql, keyspace):
+        table = util.unique_name()
+        schema = (f"CREATE TABLE {keyspace}.{table} (pk int PRIMARY KEY, v int) "
+                  "WITH compaction = {'class': 'NullCompactionStrategy'}")
+        stale_table_id = "00000000000000000000000000000000"
+        os.mkdir(os.path.join(scylla_data_dir, keyspace, f"{table}-{stale_table_id}"))
+        cql.execute(schema)
+        cql.execute(f"INSERT INTO {keyspace}.{table} (pk, v) VALUES ({key}, 0)")
+        nodetool.flush(cql, f"{keyspace}.{table}")
+        return table, schema
+
+    with scylla_sstable(table_with_stale_directory, cql, test_keyspace_tablets, scylla_data_dir) as (_, schema_file, sstables):
+        with nodetool.no_autocompaction_context(cql, "system.tablets"):
+            nodetool.flush_keyspace(cql, "system")
+            out = subprocess.check_output([scylla_path,
+                                           "sstable", "shard-of",
+                                           "--tablets",
+                                           "--schema-file", schema_file] +
+                                          sstables)
+            sstables_json = json.loads(out)['sstables']
+            for replica_sets in sstables_json.values():
+                for replica_set in replica_sets:
+                    assert replica_set['shard'] == 0
 
 
 def test_scylla_sstable_no_args(scylla_path):

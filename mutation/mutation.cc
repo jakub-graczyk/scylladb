@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/closeable.hh>
 
 #include "mutation.hh"
@@ -137,6 +138,19 @@ mutation::upgrade(const schema_ptr& new_schema) {
         schema_ptr s = new_schema;
         partition().upgrade(*schema(), *new_schema);
         _ptr->_schema = std::move(s);
+    }
+}
+
+future<> mutation::apply_gently(mutation&& m) {
+    if (m.schema()->version() != schema()->version()) {
+        // FIXME: this is not gentle
+        m.partition().upgrade(*m.schema(), *schema());
+    }
+    apply_resume res;
+    mutation_application_stats app_stats;
+    while (partition().apply_monotonically(*schema(), std::move(m.partition()), nullptr, app_stats,
+                                           is_preemptible::yes, res) == stop_iteration::no) {
+        co_await coroutine::maybe_yield();
     }
 }
 

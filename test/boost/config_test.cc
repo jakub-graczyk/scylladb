@@ -876,7 +876,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_cdc) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
     BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
     return make_ready_future();
 }
 
@@ -887,7 +886,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_unused) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
     BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
     return make_ready_future();
 }
 
@@ -898,7 +896,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_udf) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UDF});
     BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
     return make_ready_future();
 }
 
@@ -909,19 +906,36 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_alternator_streams) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
     BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
     return make_ready_future();
 }
 
 SEASTAR_TEST_CASE(test_parse_experimental_features_broadcast_tables) {
+    // broadcast-tables is a retired experimental feature: its name is still
+    // recognized, but specifying it is rejected with a readable, fatal error
+    // (rather than being silently ignored, like an ordinary parse error) so
+    // operators notice they must remove it from their configuration, e.g.
+    // after upgrading past its removal.
     auto cfg_ptr = std::make_unique<config>();
     config& cfg = *cfg_ptr;
-    cfg.read_from_yaml("experimental_features:\n    - broadcast-tables\n", throw_on_error);
-    BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::BROADCAST_TABLES});
+    using value_status = utils::config_file::value_status;
+    // The retired value escapes read_from_yaml as a dedicated exception; it is
+    // not downgraded to a warning via the error handler.
+    bool handler_called = false;
+    auto handler = [&] (const sstring&, const sstring&, std::optional<value_status>) {
+        handler_called = true;
+    };
+    try {
+        cfg.read_from_yaml("experimental_features:\n    - broadcast-tables\n", handler);
+        BOOST_FAIL("expected retired_config_value_error");
+    } catch (const utils::retired_config_value_error& e) {
+        const sstring msg = e.what();
+        BOOST_REQUIRE_NE(msg.find("broadcast-tables"), msg.npos);
+        BOOST_REQUIRE_NE(msg.find("has been removed"), msg.npos);
+    }
+    BOOST_CHECK(!handler_called);
+    // The bad value aborts parsing of the whole list, so no feature is enabled.
     BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(cfg.check_experimental(ef::BROADCAST_TABLES));
-    BOOST_CHECK(!cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
     return make_ready_future();
 }
 
@@ -929,10 +943,9 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_keyspace_storage_options) {
     auto cfg_ptr = std::make_unique<config>();
     config& cfg = *cfg_ptr;
     cfg.read_from_yaml("experimental_features:\n    - keyspace-storage-options\n", throw_on_error);
-    BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::KEYSPACE_STORAGE_OPTIONS});
-    BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
+    BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
+    BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
     return make_ready_future();
 }
 
@@ -943,7 +956,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_multiple) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), (features{ef::UNUSED, ef::UNUSED, ef::UNUSED}));
     BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
     return make_ready_future();
 }
 
@@ -957,7 +969,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_invalid) {
                            BOOST_REQUIRE_NE(msg.find("line 2, column 7"), msg.npos);
                            BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
                            BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-                           BOOST_CHECK(!cfg.check_experimental(ef::KEYSPACE_STORAGE_OPTIONS));
                        });
     return make_ready_future();
 }

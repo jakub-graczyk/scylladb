@@ -310,6 +310,14 @@ Please use :ref:`Per-table tablet options <cql-per-table-tablet-options>` instea
 
 See :doc:`Data Distribution with Tablets </architecture/tablets>` for more information about tablets.
 
+Keyspace storage options
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, SStables of a keyspace are stored locally.
+As an alternative, you can configure your keyspace to be stored
+on Amazon S3 or another S3-compatible object store.
+See :ref:`Keyspace storage options <cql-keyspace-storage-options>` for details.
+
 .. _consistency-option:
 
 Keyspace ``consistency`` options :label-caution:`Experimental`
@@ -1326,7 +1334,8 @@ A table can be truncated using the ``TRUNCATE`` statement:
    
    truncate_statement: TRUNCATE [ TABLE ] `table_name`
                      : [ USING TIMEOUT `timeout` ]
-   timeout: `duration`
+   timeout: `duration` | `bind_marker`
+   bind_marker: '?' | ':' `identifier`
 
 Note that ``TRUNCATE TABLE foo`` is allowed for consistency with other DDL statements, but tables are the only object
 that can be truncated currently and so the ``TABLE`` keyword can be omitted.
@@ -1338,6 +1347,10 @@ The ``USING TIMEOUT`` clause allows specifying a timeout for a specific request.
 For example::
 
   TRUNCATE TABLE users USING TIMEOUT 5m;
+
+In a prepared statement, the timeout can be given as a bind marker::
+
+  TRUNCATE TABLE users USING TIMEOUT ?;
 
 .. caution:: Do not run any operation on a table that is being truncated. Truncate operation is an administrative operation, and running any other operation on the same table in parallel may cause the truncating table's data to end up in an undefined state.
 

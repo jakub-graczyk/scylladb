@@ -455,6 +455,11 @@ public:
         } catch (boost::program_options::invalid_option_value&) {
             return false;
         }
+        if (rhs == db::experimental_features_t::feature::RETIRED) {
+            throw utils::retired_config_value_error(seastar::format(
+                "experimental feature '{}' has been removed; "
+                "please remove it from the 'experimental_features' configuration", name));
+        }
         return true;
     }
 };
@@ -704,7 +709,8 @@ static db::tri_mode_restriction_t::mode strict_allow_filtering_default() {
 static std::vector<sstring> experimental_feature_names() {
     std::vector<sstring> ret;
     for (const auto& f : db::experimental_features_t::map()) {
-        if (f.second != db::experimental_features_t::feature::UNUSED) {
+        if (f.second != db::experimental_features_t::feature::UNUSED &&
+            f.second != db::experimental_features_t::feature::RETIRED) {
             ret.push_back(f.first);
         }
     }
@@ -970,10 +976,13 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "* offheap_objects  Native memory, eliminating NIO buffer heap overhead.")
     , memtable_cleanup_threshold(this, "memtable_cleanup_threshold", value_status::Invalid, .11,
         "Ratio of occupied non-flushing memtable size to total permitted size for triggering a flush of the largest memtable. Larger values mean larger flushes and less compaction, but also less concurrent flush activity, which can make it difficult to keep your disks saturated under heavy write load.")
-    , logstor_disk_size_in_mb(this, "logstor_disk_size_in_mb", value_status::Used, 2048,
+    , logstor_disk_size_in_mb(this, "logstor_disk_size_in_mb", value_status::Used, 0,
         "Total size in megabytes allocated for logstor storage on disk.")
     , logstor_file_size_in_mb(this, "logstor_file_size_in_mb", value_status::Used, 32,
         "Total size in megabytes allocated for each logstor data file on disk.")
+    , logstor_format_on_startup(this, "logstor_format_on_startup", value_status::Used, true,
+        "Controls when logstor data files are formatted. When enabled, all logstor files are formatted during node startup, which increases startup time but ensures optimal write performance immediately after startup. "
+        "When disabled, logstor files are formatted lazily on first write, which reduces startup time but may cause slightly degraded write performance on first access to each file.")
     , logstor_separator_delay_limit_ms(this, "logstor_separator_delay_limit_ms", value_status::Used, 100,
         "Maximum delay in milliseconds for logstor separator debt control.")
     , logstor_separator_max_memory_in_mb(this, "logstor_separator_max_memory_in_mb", value_status::Used, 256,
@@ -1330,11 +1339,12 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "* org.apache.cassandra.auth.AllowAllAuthenticator: Disables authentication; no checks are performed.\n"
         "* org.apache.cassandra.auth.PasswordAuthenticator: Authenticates users with user names and hashed passwords stored in the system_auth.credentials table. If you use the default, 1, and the node with the lone replica goes down, you will not be able to log into the cluster because the system_auth keyspace was not replicated.\n"
         "* com.scylladb.auth.CertificateAuthenticator: Authenticates users based on TLS certificate authentication subject. Roles and permissions still need to be defined as normal. Super user can be set using the 'auth_superuser_name' configuration value. Query to extract role name from subject string is set using 'auth_certificate_role_queries'.\n"
+        "* com.scylladb.auth.CertificateOrPasswordAuthenticator: Accepts either a TLS client certificate (role name derived via 'auth_certificate_role_queries', no SASL exchange) or a username/password pair (SASL). Designed for use with a truststore and require_client_auth=optional (REQUEST mode), enabling a single CQL port to serve both certificate-bearing and password-authenticated clients.\n"
         "* com.scylladb.auth.TransitionalAuthenticator: Wraps around the PasswordAuthenticator, logging them in if username/password pair provided is correct and treating them as anonymous users otherwise.\n"
         "* com.scylladb.auth.SaslauthdAuthenticator : Use saslauthd for authentication.\n"
         "\n"
         "Related information: Internal authentication", 
-        {"AllowAllAuthenticator", "PasswordAuthenticator", "CertificateAuthenticator", "org.apache.cassandra.auth.PasswordAuthenticator", "com.scylladb.auth.SaslauthdAuthenticator", "org.apache.cassandra.auth.AllowAllAuthenticator", "com.scylladb.auth.TransitionalAuthenticator", "com.scylladb.auth.CertificateAuthenticator"})
+        {"AllowAllAuthenticator", "PasswordAuthenticator", "CertificateAuthenticator", "CertificateOrPasswordAuthenticator", "org.apache.cassandra.auth.PasswordAuthenticator", "com.scylladb.auth.SaslauthdAuthenticator", "org.apache.cassandra.auth.AllowAllAuthenticator", "com.scylladb.auth.TransitionalAuthenticator", "com.scylladb.auth.CertificateAuthenticator", "com.scylladb.auth.CertificateOrPasswordAuthenticator"})
     , internode_authenticator(this, "internode_authenticator", value_status::Unused, "enabled",
         "Internode authentication backend. It implements org.apache.cassandra.auth.AllowAllInternodeAuthenticator to allows or disallow connections from peer nodes.")
     , authorizer(this, "authorizer", value_status::Used, "org.apache.cassandra.auth.AllowAllAuthorizer",
@@ -1374,7 +1384,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The advanced settings are:\n"
         "\n"
         "* priority_string: (Default: not set, use default) GnuTLS priority string controlling TLS algorithms used/allowed.\n"
-        "* require_client_auth: (Default: false ) Enables or disables certificate authentication.\n"
+        "* require_client_auth: (Default: false) Controls peer certificate verification. Valid values: true (require a peer certificate), false (no peer certificate), optional (request but do not require a peer certificate).\n"
         "\n"
         "Related information: Node-to-node encryption")
     , client_encryption_options(this, "client_encryption_options", value_status::Used, {/*none*/},
@@ -1388,7 +1398,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The advanced settings are:\n"
         "\n"
         "* priority_string: (Default: not set, use default) GnuTLS priority string controlling TLS algorithms used/allowed.\n"
-        "* require_client_auth: (Default: false) Enables or disables certificate authentication.\n"
+        "* require_client_auth: (Default: false) Controls client certificate verification. Valid values: true (require a client certificate), false (no client certificate), optional (request but do not require a client certificate; clients may authenticate via certificate or fall back to other mechanisms, e.g., password for CQL CertificateOrPasswordAuthenticator).\n"
         "* enable_session_tickets: (Default: true) Enables or disables TLS1.3 session tickets.\n"
         "\n"
         "Related information: Client-to-node encryption")
@@ -1396,10 +1406,12 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "When Alternator via HTTPS is enabled with alternator_https_port, where to take the key and certificate. The available options are:\n"
         "* certificate: (Default: conf/scylla.crt) The location of a PEM-encoded x509 certificate used to identify and encrypt the client/server communication.\n"
         "* keyfile: (Default: conf/scylla.key) PEM Key file associated with certificate.\n"
+        "* truststore: (Default: <not set, use system truststore>) Location of the truststore containing the trusted certificate for authenticating client certificates.\n"
         "\n"
         "The advanced settings are:\n"
         "\n"
         "* priority_string: GnuTLS priority string controlling TLS algorithms used/allowed.\n"
+        "* require_client_auth: (Default: false) Controls client certificate verification. Valid values: true (require a client certificate), false (no client certificate), optional (request but do not require a client certificate; clients may authenticate via certificate or fall back to SigV4 signatures in requests).\n"
         "* enable_session_tickets: (Default: true) Enables or disables TLS1.3 session tickets.")
     , alternator_force_read_before_write(this, "alternator_force_read_before_write", liveness::LiveUpdate, value_status::Used, false, "Forces Alternator to perform Read Before Write. Used for better DynamoDB compatibility in WCU calculation")
     , ssl_storage_port(this, "ssl_storage_port", value_status::Used, 7001,
@@ -1595,6 +1607,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
             "Use on a new, parallel algorithm for performing aggregate queries.")
     , cql_duplicate_bind_variable_names_refer_to_same_variable(this, "cql_duplicate_bind_variable_names_refer_to_same_variable", liveness::LiveUpdate, value_status::Used, true,
             "A bind variable that appears twice in a CQL query refers to a single variable (if false, no name matching is performed).")
+    , cql_in_bind_variable_name_uses_uppercase_operator(this, "cql_in_bind_variable_name_uses_uppercase_operator", liveness::LiveUpdate, value_status::Used, true,
+            "Name the bind variable of an IN restriction \"IN(column)\" (if false, the operator is spelled in lowercase, \"in(column)\").")
     , max_relations_in_where_clause(this, "max_relations_in_where_clause", liveness::LiveUpdate, value_status::Used, 100,
             "Maximum number of relations allowed in a WHERE clause. Queries with too many relations can cause quadratic complexity.")
     , select_internal_page_size(this, "select_internal_page_size", liveness::LiveUpdate, value_status::Used, 10000,
@@ -1805,6 +1819,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Throttles background I/O to the specified total throughput (in MiBs/s) across the entire system. Background I/O includes the one performed by repair and both RBNO and legacy topology operations such as adding or removing a node. Setting the value to 0 disables background IO throttling. It is recommended to set the value for this parameter to be 75% of network bandwidth")
     , backup_io_throughput_mb_per_sec(this, "backup_io_throughput_mb_per_sec", liveness::LiveUpdate, value_status::Used, 0,
         "Throttles backup I/O to the specified total throughput (in MiBs/s) across the entire system")
+    , force_effective_capacity_to_raw_disk_capacity(this, "force_effective_capacity_to_raw_disk_capacity", liveness::LiveUpdate, value_status::Used, false,
+        "Forces effective_capacity used in tablets load balancing to be the equal to the raw disk capacity instead of the sum of tablet "
+        "sizes and available disk space.")
     , default_log_level(this, "default_log_level", value_status::Used, seastar::log_level::info, "Default log level for log messages")
     , logger_log_level(this, "logger_log_level", value_status::Used, {}, "Map of logger name to log level. Valid log levels are 'error', 'warn', 'info', 'debug' and 'trace'")
     , log_to_stdout(this, "log_to_stdout", value_status::Used, true, "Send log output to stdout")
@@ -2058,8 +2075,8 @@ std::map<sstring, db::experimental_features_t::feature> db::experimental_feature
         {"alternator-streams", feature::UNUSED},
         {"alternator-ttl", feature::UNUSED },
         {"consistent-topology-changes", feature::UNUSED},
-        {"broadcast-tables", feature::BROADCAST_TABLES},
-        {"keyspace-storage-options", feature::KEYSPACE_STORAGE_OPTIONS},
+        {"broadcast-tables", feature::RETIRED},
+        {"keyspace-storage-options", feature::UNUSED},
         {"tablets", feature::UNUSED},
         {"views-with-tablets", feature::UNUSED},
         {"strongly-consistent-tables", feature::STRONGLY_CONSISTENT_TABLES},
@@ -2101,7 +2118,8 @@ std::unordered_map<sstring, db::consistency_level> db::consistency_level_restric
 std::vector<enum_option<db::experimental_features_t>> db::experimental_features_t::all() {
     std::vector<enum_option<db::experimental_features_t>> ret;
     for (const auto& f : db::experimental_features_t::map()) {
-        if (f.second != db::experimental_features_t::feature::UNUSED) {
+        if (f.second != db::experimental_features_t::feature::UNUSED &&
+            f.second != db::experimental_features_t::feature::RETIRED) {
             ret.push_back(f.second);
         }
     }
@@ -2198,8 +2216,17 @@ future<> configure_tls_creds_builder(seastar::tls::credentials_builder& creds, d
     if (options.contains("priority_string")) {
         creds.set_priority_string(options.at("priority_string"));
     }
-    if (is_true(get_or_default(options, "require_client_auth", "false"))) {
+    auto require_client_auth_val = get_or_default(options, "require_client_auth", "false");
+    std::transform(require_client_auth_val.begin(), require_client_auth_val.end(), require_client_auth_val.begin(), ::tolower);
+    if (is_true(require_client_auth_val)) {
         creds.set_client_auth(seastar::tls::client_auth::REQUIRE);
+    } else if (require_client_auth_val == "optional") {
+        // "optional": request a client certificate during the TLS handshake but
+        // do not require one. If the client presents a cert it will be validated
+        // and used for certificate-based authentication; if it doesn't, fallback
+        // mechanisms will be used (e.g., Alternator will try SigV4 authentication,
+        // and CQL CertificateOrPasswordAuthenticator will try password authentication).
+        creds.set_client_auth(seastar::tls::client_auth::REQUEST);
     }
     if (is_true(get_or_default(options, "enable_session_tickets", "true"))) {
         creds.set_session_resume_mode(seastar::tls::session_resume_mode::TLS13_SESSION_TICKET);

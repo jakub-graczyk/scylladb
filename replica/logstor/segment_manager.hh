@@ -36,15 +36,16 @@ class compaction_manager;
 class segment_set;
 class primary_index;
 
-static constexpr size_t default_segment_size = 128 * 1024;
-static constexpr size_t default_file_size = 32 * 1024 * 1024;
+static constexpr uint64_t default_segment_size = 128 * 1024;
+static constexpr uint64_t default_file_size = 32 * 1024 * 1024;
 
 /// Configuration for the segment manager
 struct segment_manager_config {
     std::filesystem::path base_dir;
-    size_t segment_size = default_segment_size;
-    size_t file_size = default_file_size;
-    size_t disk_size;
+    uint64_t segment_size = default_segment_size;
+    uint64_t file_size = default_file_size;
+    uint64_t disk_size;
+    bool format_on_startup = true;
     bool compaction_enabled = true;
     size_t max_segments_per_compaction = 8;
     seastar::scheduling_group compaction_sg;
@@ -99,7 +100,7 @@ public:
 class segment_manager_impl;
 class log_index;
 
-class segment_manager {
+class segment_manager : public space_accounting_subscriber {
     std::unique_ptr<segment_manager_impl> _impl;
 private:
     segment_manager_impl& get_impl() noexcept;
@@ -121,7 +122,8 @@ public:
 
     future<log_record> read(log_location location);
 
-    void free_record(log_location location);
+    void on_add_record(log_location location) noexcept override;
+    void on_free_record(log_location location) noexcept override;
 
     compaction_manager& get_compaction_manager() noexcept;
     const compaction_manager& get_compaction_manager() const noexcept;
@@ -129,7 +131,7 @@ public:
     void set_trigger_compaction_hook(std::function<void()> fn);
     void set_trigger_separator_flush_hook(std::function<void(segment_sequence)> fn);
 
-    size_t get_segment_size() const noexcept;
+    uint64_t get_segment_size() const noexcept;
 
     future<> discard_segments(segment_set&);
 

@@ -122,9 +122,13 @@ namespace db {
 struct experimental_features_t {
     enum class feature {
         UNUSED,
+        // A feature that has been removed. Unlike UNUSED (a graduated,
+        // no-longer-experimental feature whose name is silently accepted),
+        // a RETIRED feature name is still recognized but rejected with a
+        // clear, fatal error at startup, so operators notice they must remove
+        // it from their configuration (e.g. after upgrading past its removal).
+        RETIRED,
         UDF,
-        BROADCAST_TABLES,
-        KEYSPACE_STORAGE_OPTIONS,
         STRONGLY_CONSISTENT_TABLES,
         LOGSTOR,
     };
@@ -273,6 +277,7 @@ public:
     named_value<double> memtable_cleanup_threshold;
     named_value<uint32_t> logstor_disk_size_in_mb;
     named_value<uint32_t> logstor_file_size_in_mb;
+    named_value<bool> logstor_format_on_startup;
     named_value<uint32_t> logstor_separator_delay_limit_ms;
     named_value<uint32_t> logstor_separator_max_memory_in_mb;
     named_value<uint32_t> file_cache_size_in_mb;
@@ -504,6 +509,7 @@ public:
     named_value<bool> enable_cql_config_updates;
     named_value<bool> enable_parallelized_aggregation;
     named_value<bool> cql_duplicate_bind_variable_names_refer_to_same_variable;
+    named_value<bool> cql_in_bind_variable_name_uses_uppercase_operator;
     named_value<uint32_t> max_relations_in_where_clause;
     named_value<uint32_t> select_internal_page_size;
 
@@ -670,6 +676,8 @@ public:
 
     named_value<uint32_t> maintenance_io_throughput_mb_per_sec;
     named_value<uint32_t> backup_io_throughput_mb_per_sec;
+
+    named_value<bool> force_effective_capacity_to_raw_disk_capacity;
 
     static const sstring default_tls_priority;
 private:

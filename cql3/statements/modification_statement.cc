@@ -12,7 +12,6 @@
 #include "utils/assert.hh"
 #include "cql3/cql_statement.hh"
 #include "cql3/statements/modification_statement.hh"
-#include "cql3/statements/broadcast_modification_statement.hh"
 #include "cql3/statements/raw/modification_statement.hh"
 #include "cql3/statements/prepared_statement.hh"
 #include "cql3/expr/expr-utils.hh"
@@ -30,7 +29,6 @@
 #include "cql3/query_processor.hh"
 #include "service/storage_proxy.hh"
 #include "db/large_data_handler.hh"
-#include "service/broadcast_tables/experimental/lang.hh"
 #include "cql3/statements/strong_consistency/modification_statement.hh"
 #include "cql3/statements/strong_consistency/statement_helpers.hh"
 
@@ -59,7 +57,7 @@ db::timeout_clock::duration modification_statement::get_timeout(const service::c
 }
 
 modification_statement::modification_statement(statement_type type_, uint32_t bound_terms, schema_ptr schema_, std::unique_ptr<attributes> attrs_, cql_stats& stats_)
-    : cql_statement_opt_metadata(modification_statement_timeout(*schema_))
+    : cql_statement(modification_statement_timeout(*schema_))
     , type{type_}
     , _bound_terms{bound_terms}
     , _columns_to_read(schema_->all_columns_count())
@@ -543,7 +541,7 @@ void modification_statement::build_cas_result_set_metadata() {
 void
 modification_statement::process_where_clause(data_dictionary::database db, expr::expression where_clause, prepare_context& ctx) {
     _restrictions = restrictions::analyze_statement_restrictions(db, s, type, where_clause, ctx,
-            applies_only_to_static_columns(), _selects_a_collection, false /* allow_filtering */, restrictions::check_indexes::no);
+            applies_only_to_static_columns(), false /* for_view */, false /* allow_filtering */, restrictions::check_indexes::no);
     /*
      * If there's no clustering columns restriction, we may assume that EXISTS
      * check only selects static columns and hence we can use any row from the
@@ -608,12 +606,6 @@ modification_statement::process_where_clause(data_dictionary::database db, expr:
     }
 }
 
-::shared_ptr<broadcast_modification_statement>
-modification_statement::prepare_for_broadcast_tables() const {
-    // FIXME: implement for every type of `modification_statement`.
-    throw service::broadcast_tables::unsupported_operation_error{};
-}
-
 namespace raw {
 
 std::unique_ptr<prepared_statement>
@@ -628,9 +620,6 @@ modification_statement::prepare(data_dictionary::database db, cql_stats& stats, 
             return ::make_shared<strong_consistency::modification_statement>(std::move(result));
         }
 
-        if (service::broadcast_tables::is_broadcast_table_statement(keyspace(), column_family())) {
-            return result->prepare_for_broadcast_tables();
-        }
         return result;
     });
 
@@ -647,6 +636,15 @@ modification_statement::prepare(data_dictionary::database db, prepare_context& c
     prepared_attributes->fill_prepare_context(ctx);
 
     auto prepared_stmt = prepare_internal(db, schema, ctx, std::move(prepared_attributes), stats);
+    if (strong_consistency::is_strongly_consistent(db, schema->ks_name())) {
+        if (prepared_stmt->requires_read()) {
+            throw exceptions::invalid_request_exception("Strongly consistent updates don't support data prefetch");
+        }
+        if (prepared_stmt->is_timestamp_set()) {
+            throw exceptions::invalid_request_exception("Strongly consistent queries don't support user-provided timestamps");
+        }
+    }
+
     // At this point the prepare context instance should have a list of
     // `function_call` AST nodes corresponding to non-pure functions that
     // evaluate partition key constraints.
@@ -691,8 +689,8 @@ update_for_lwt_null_equality_rules(const expr::expression& e) {
 
 static
 expr::expression
-column_condition_prepare(const expr::expression& expr, data_dictionary::database db, const sstring& keyspace, const schema& schema){
-    auto prepared = expr::prepare_expression(expr, db, keyspace, &schema, make_lw_shared<column_specification>("", "", make_shared<column_identifier>("IF condition", true), boolean_type));
+column_condition_prepare(const expr::expression& expr, data_dictionary::database db, const sstring& keyspace, const schema& schema, const dialect& d){
+    auto prepared = expr::prepare_expression_allowing_relations(expr, db, keyspace, &schema, make_lw_shared<column_specification>("", "", make_shared<column_identifier>("IF condition", true), boolean_type), d);
     expr::verify_no_aggregate_functions(prepared, "IF clause");
 
     expr::for_each_expression<expr::column_value>(prepared, [] (const expr::column_value& cval) {
@@ -745,7 +743,7 @@ modification_statement::prepare_conditions(data_dictionary::database db, const s
             throwing_assert(!_if_not_exists);
             stmt.set_if_exist_condition();
         } else {
-            stmt._condition = column_condition_prepare(*_conditions, db, keyspace(), schema);
+            stmt._condition = column_condition_prepare(*_conditions, db, keyspace(), schema, ctx.get_dialect());
             expr::fill_prepare_context(stmt._condition, ctx);
             stmt.analyze_condition(stmt._condition);
         }
@@ -787,7 +785,6 @@ void modification_statement::add_operation(std::unique_ptr<operation> op) {
         _sets_static_columns = true;
     } else {
         _sets_regular_columns = true;
-        _selects_a_collection |= op->column.type->is_collection();
     }
     if (op->requires_read()) {
         _requires_read = true;
@@ -833,7 +830,6 @@ void modification_statement::analyze_condition(expr::expression cond) {
         _has_static_column_conditions = true;
     } else {
         _has_regular_column_conditions = true;
-        _selects_a_collection |=  col.col->type->is_collection();
     }
   });
 }

@@ -21,14 +21,13 @@
 #include "cql3/statements/raw/select_statement.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/statements/prune_materialized_view_statement.hh"
-#include "cql3/statements/broadcast_select_statement.hh"
 
 #include "exceptions/exceptions.hh"
 #include <seastar/core/future.hh>
 #include <seastar/coroutine/exception.hh>
 #include "index/vector_index.hh"
+#include "index/fulltext_index.hh"
 #include "locator/tablets.hh"
-#include "service/broadcast_tables/experimental/lang.hh"
 #include "service/qos/qos_common.hh"
 #include "transport/cql_protocol_extension.hh"
 #include "transport/messages/result_message.hh"
@@ -39,6 +38,7 @@
 #include "cql3/restrictions/statement_restrictions.hh"
 #include "index/secondary_index.hh"
 #include "validation.hh"
+#include "db/system_keyspace.hh"
 #include "exceptions/unrecognized_entity_exception.hh"
 #include <optional>
 #include <ranges>
@@ -267,8 +267,16 @@ future<> select_statement::check_access(query_processor& qp, const service::clie
             ? _schema->view_info()->base_name()
             : (cdc ? cdc->cf_name() : column_family());
         const schema_ptr& base_schema = cdc ? cdc : _schema;
-        bool is_vector_indexed = secondary_index::vector_index::has_index(*base_schema);
-        co_await state.has_column_family_access(keyspace(), cf_name, auth::permission::SELECT, auth::command_desc::type::OTHER, is_vector_indexed);
+        // A table's external index permissions also authorize SELECT on it, so a user holding
+        // one of them can read the table without a full SELECT grant.
+        auth::permission_set additional_permissions;
+        if (secondary_index::vector_index::has_index(*base_schema)) {
+            additional_permissions.set<auth::permission::VECTOR_SEARCH_INDEXING>();
+        }
+        if (secondary_index::fulltext_index::has_index(*base_schema)) {
+            additional_permissions.set<auth::permission::TEXT_SEARCH_INDEXING>();
+        }
+        co_await state.has_column_family_access(keyspace(), cf_name, auth::permission::SELECT, auth::command_desc::type::OTHER, additional_permissions);
     } catch (const data_dictionary::no_such_column_family& e) {
         // Will be validated afterwards.
         co_return;
@@ -1984,7 +1992,7 @@ audit::statement_category select_statement::category() const {
     return audit::statement_category::QUERY;
 }
 
-select_statement::select_statement(cf_name cf_name,
+select_statement::select_statement(std::optional<cf_name> cf_name,
                                    lw_shared_ptr<const parameters> parameters,
                                    std::vector<::shared_ptr<selection::raw_selector>> select_clause,
                                    expr::expression where_clause,
@@ -1992,7 +2000,7 @@ select_statement::select_statement(cf_name cf_name,
                                    std::optional<expr::expression> per_partition_limit,
                                    std::vector<::shared_ptr<cql3::column_identifier::raw>> group_by_columns,
                                    std::unique_ptr<attributes::raw> attrs)
-    : cf_statement(cf_name)
+    : cf_statement(std::move(cf_name))
     , _parameters(std::move(parameters))
     , _select_clause(std::move(select_clause))
     , _where_clause(std::move(where_clause))
@@ -2002,6 +2010,20 @@ select_statement::select_statement(cf_name cf_name,
     , _attrs(std::move(attrs))
 {
     validate_attrs(*_attrs);
+    if (!_cf_name) {
+        // SELECT without FROM: run on the system.one_row table.
+        _cf_name.emplace();
+        _cf_name->set_keyspace(db::system_keyspace::NAME, true);
+        _cf_name->set_column_family(db::system_keyspace::ONE_ROW, true);
+        _no_from = true;
+    }
+}
+
+void select_statement::prepare_keyspace(const service::client_state& state) {
+    cf_statement::prepare_keyspace(state);
+    if (_no_from) {
+        _session_keyspace = state.get_raw_keyspace();
+    }
 }
 
 std::vector<selection::prepared_selector>
@@ -2055,11 +2077,16 @@ group_by_references_clustering_keys(const selection::selection& sel, const std::
 }
 
 std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg, bool for_view) {
+    if (_no_from && _select_clause.empty()) {
+        // No table to expand the wildcard against.
+        // Rejecting before maybe_jsonize_select_clause() guards against SELECT JSON *.
+        throw exceptions::invalid_request_exception("SELECT * is not allowed without a FROM clause");
+    }
     schema_ptr underlying_schema = validation::validate_column_family(db, keyspace(), column_family());
     schema_ptr schema = _parameters->is_mutation_fragments() ? mutation_fragments_select_statement::generate_output_schema(underlying_schema) : underlying_schema;
     prepare_context& ctx = get_prepare_context();
 
-    auto prepared_selectors = selection::raw_selector::to_prepared_selectors(_select_clause, *schema, db, keyspace());
+    auto prepared_selectors = selection::raw_selector::to_prepared_selectors(_select_clause, *schema, db, _no_from ? _session_keyspace : keyspace());
 
     prepared_selectors = maybe_jsonize_select_clause(std::move(prepared_selectors), db, schema);
 
@@ -2318,20 +2345,6 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
             stats,
             std::move(prepared_attrs)
         );
-    } else if (service::broadcast_tables::is_broadcast_table_statement(keyspace(), column_family())) {
-        stmt = ::make_shared<cql3::statements::broadcast_select_statement>(
-                schema,
-                ctx.bound_variables_size(),
-                _parameters,
-                std::move(selection),
-                std::move(restrictions),
-                std::move(group_by_cell_indices),
-                is_reversed_,
-                std::move(ordering_comparator),
-                prepare_limit(db, ctx, _limit),
-                prepare_limit(db, ctx, _per_partition_limit),
-                stats,
-                std::move(prepared_attrs));
     } else {
         stmt = ::make_shared<cql3::statements::primary_key_select_statement>(
                 schema,
@@ -2742,7 +2755,7 @@ std::unique_ptr<cql3::statements::raw::select_statement> build_select_statement(
             const std::string_view& cf_name,
             const std::string_view& where_clause,
             bool select_all_columns,
-            const std::vector<column_definition>& selected_columns) {
+            const utils::chunked_vector<column_definition>& selected_columns) {
     std::ostringstream out;
     out << "SELECT ";
     if (select_all_columns) {
@@ -2761,9 +2774,9 @@ std::unique_ptr<cql3::statements::raw::select_statement> build_select_statement(
     if (!where_clause.empty()) {
         out << " WHERE " << where_clause << " ALLOW FILTERING";
     }
-    // In general it's not a good idea to use the default dialect, but here the database is talking to
-    // itself, so we can hope the dialects are mutually compatible here.
-    return do_with_parser(out.str(), dialect{}, std::mem_fn(&cql3_parser::CqlParser::selectStatement));
+    // The database is talking to itself here, over a statement which was already validated when the
+    // user submitted it, so the client-facing dialect limits must not be applied again.
+    return do_with_parser(out.str(), internal_dialect(), std::mem_fn(&cql3_parser::CqlParser::selectStatement));
 }
 
 }

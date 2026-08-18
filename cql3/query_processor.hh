@@ -27,7 +27,6 @@
 #include "mutation/timestamp.hh"
 #include "transport/messages/result_message.hh"
 #include "service/client_state.hh"
-#include "service/broadcast_tables/experimental/query_result.hh"
 #include "vector_search/vector_store_client.hh"
 #include "utils/assert.hh"
 #include "utils/observable.hh"
@@ -54,9 +53,6 @@ namespace strong_consistency {
 class coordinator;
 }
 
-namespace broadcast_tables {
-struct query;
-}
 }
 
 namespace cql3 {
@@ -480,32 +476,22 @@ public:
 
     future<> stop();
 
-    inline
     future<::shared_ptr<cql_transport::messages::result_message>>
     execute_batch(
             ::shared_ptr<statements::batch_statement> stmt,
             service::query_state& query_state,
             query_options& options,
-            std::unordered_map<prepared_cache_key_type, authorized_prepared_statements_cache::value_type> pending_authorization_entries) {
-        return execute_batch_without_checking_exception_message(
-                std::move(stmt),
-                query_state,
-                options,
-                std::move(pending_authorization_entries))
-                .then(cql_transport::messages::propagate_exception_as_future<::shared_ptr<cql_transport::messages::result_message>>);
-    }
+            std::unordered_map<prepared_cache_key_type, authorized_prepared_statements_cache::value_type> pending_authorization_entries);
 
     // Like execute_batch, but is allowed to return exceptions as result_message::exception.
     // The result_message::exception must be explicitly handled.
     future<::shared_ptr<cql_transport::messages::result_message>>
     execute_batch_without_checking_exception_message(
-            ::shared_ptr<statements::batch_statement>,
+            ::shared_ptr<cql_statement>,
             service::query_state& query_state,
             query_options& options,
+            size_t batch_size,
             std::unordered_map<prepared_cache_key_type, authorized_prepared_statements_cache::value_type> pending_authorization_entries);
-
-    future<service::broadcast_tables::query_result>
-    execute_broadcast_table_query(const service::broadcast_tables::query&);
 
     // Splits given `mapreduce_request` and distributes execution of resulting subrequests across a cluster.
     future<query::mapreduce_result>

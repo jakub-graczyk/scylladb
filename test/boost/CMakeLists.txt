@@ -360,6 +360,7 @@ add_scylla_test(combined_tests
     database_test.cc
     data_listeners_test.cc
     disk_space_monitor_test.cc
+    digest_checked_data_source_test.cc
     error_injection_test.cc
     extensions_test.cc
     filtering_test.cc
@@ -377,6 +378,7 @@ add_scylla_test(combined_tests
     mutation_reader_test.cc
     mutation_writer_test.cc
     network_topology_strategy_test.cc
+    paxos_state_test.cc
     per_partition_rate_limit_test.cc
     pluggable_test.cc
     querier_cache_test.cc

@@ -50,6 +50,7 @@ class ThreadsCalculator:
 
     def __init__(self,
                  modes: list[str],
+                 threads_multiplier: float = 1.0,
                  min_system_memory_reserve: float = 5e9,
                  max_system_memory_reserve: float = 8e9,
                  system_memory_reserve_fraction = 16,
@@ -77,10 +78,11 @@ class ThreadsCalculator:
             debug_cpus_per_test_job if is_debug else non_debug_cpus_per_test_job
         )
         self.default_num_jobs_mem = max(1, int(available_mem // test_mem))
+        self.threadt_multiplier = threads_multiplier
 
     def get_number_of_threads(self, nr_cpus: int) -> int:
         default_num_jobs_cpu = max(1, math.ceil(nr_cpus / self.cpus_per_test_job))
-        return min(self.default_num_jobs_mem, default_num_jobs_cpu)
+        return int(min(self.default_num_jobs_mem, default_num_jobs_cpu) * self.threadt_multiplier)
 
 
 
@@ -118,8 +120,14 @@ def parse_cmd_line() -> argparse.Namespace:
                         help='Verbose reporting')
     parser.add_argument('--quiet', '-q', action='store_true', default=False,
                         help='Quiet reporting')
-    parser.add_argument('--jobs', '-j', action="store", type=int,
+    threads = parser.add_mutually_exclusive_group(required=False)
+    threads.add_argument('--jobs', '-j', action="store", type=int,
                         help="Number of jobs to use for running the tests")
+    threads.add_argument('--threads-multiplier', type=float, default=1.0,
+                         dest="threads_multiplier", action="store",
+                         help="Multiplier for the number of threads to use for running the tests. Default is) 1.0, "
+                              "which means no change. Use a value less than 1.0 to reduce the number of threads, or a"
+                              "value greater than 1.0 to increase the number of threads.")
     parser.add_argument('--save-log-on-success', "-s", default=False,
                         dest="save_log_on_success", action="store_true",
                         help="Save test log output on success and skip cleanup before the run.")
@@ -200,7 +208,14 @@ def parse_cmd_line() -> argparse.Namespace:
     if args.skip_patterns and args.k:
         parser.error(palette.fail('arguments --skip and -k are mutually exclusive, please use only one of them'))
 
-    if not args.modes:
+    if args.exe_path or args.exe_url:
+        if args.modes:
+            parser.error(palette.fail('arguments --exe-path/--exe-url and --mode are mutually exclusive, please use only one of them'))
+        # The executable under test is given explicitly, so no configured
+        # build is required; the pytest runner derives the "custom_exe" mode
+        # from the executable options.
+        args.modes = []
+    elif not args.modes:
         try:
             args.modes = get_configured_modes()
         except Exception:
@@ -214,7 +229,7 @@ def parse_cmd_line() -> argparse.Namespace:
             nr_cpus = int(subprocess.check_output(
                 ['taskset', '-c', args.cpus, 'python3', '-c',
                  'import os; print(len(os.sched_getaffinity(0)))']))
-        args.jobs = ThreadsCalculator(args.modes).get_number_of_threads(nr_cpus)
+        args.jobs = ThreadsCalculator(args.modes, args.threads_multiplier).get_number_of_threads(nr_cpus)
 
     if not args.coverage_modes and args.coverage:
         args.coverage_modes = list(args.modes)
@@ -343,6 +358,8 @@ def run_pytest(options: argparse.Namespace) -> int:
         args.append(f'--random-seed={options.random_seed}')
     if options.gather_metrics:
         args.append('--gather-metrics')
+    if options.artifacts_dir_url:
+        args.append(f'--artifacts_dir_url={options.artifacts_dir_url}')
     if options.timeout:
         args.append(f'--timeout={options.timeout}')
     if options.session_timeout:
@@ -353,6 +370,10 @@ def run_pytest(options: argparse.Namespace) -> int:
         args.append(f'-k={options.k}')
     if options.extra_scylla_cmdline_options:
         args.append(f'--extra-scylla-cmdline-options={options.extra_scylla_cmdline_options}')
+    if options.exe_path:
+        args.append(f'--exe-path={options.exe_path}')
+    if options.exe_url:
+        args.append(f'--exe-url={options.exe_url}')
     if not options.save_log_on_success:
         args.append('--allure-no-capture')
     else:

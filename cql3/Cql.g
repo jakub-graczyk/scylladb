@@ -327,7 +327,7 @@ query returns [std::unique_ptr<raw::parsed_statement> stmnt]
     ;
 
 cqlStatement returns [std::unique_ptr<raw::parsed_statement> stmt]
-    @after{ if (stmt) { stmt->set_bound_variables(_bind_variable_names); } }
+    @after{ if (stmt) { stmt->set_bound_variables(_bind_variable_names, _dialect); } }
     : st1= selectStatement             { $stmt = std::move(st1); }
     | st2= insertStatement             { $stmt = std::move(st2); }
     | st3= updateStatement             { $stmt = std::move(st3); }
@@ -408,18 +408,21 @@ selectStatement returns [std::unique_ptr<raw::select_statement> expr]
         auto attrs = std::make_unique<cql3::attributes::raw>();
         expression wclause = conjunction{};
         bool is_similarity_ordering = false;
+        bool has_from = false;
     }
     : K_SELECT (
                 ( (K_JSON K_DISTINCT)=> K_JSON { statement_subtype = raw::select_statement::parameters::statement_subtype::JSON; }
-                | (K_JSON selectClause K_FROM)=> K_JSON { statement_subtype = raw::select_statement::parameters::statement_subtype::JSON; }
+                | (K_JSON selectClause)=> K_JSON { statement_subtype = raw::select_statement::parameters::statement_subtype::JSON; }
                 )?
                 ( (K_DISTINCT selectClause K_FROM)=> K_DISTINCT { is_distinct = true; } )?
                 sclause=selectClause
                )
-      K_FROM (
-                cf=columnFamilyName
-                | K_MUTATION_FRAGMENTS '(' cf=columnFamilyName ')' { statement_subtype = raw::select_statement::parameters::statement_subtype::MUTATION_FRAGMENTS; }
-             )
+      ( K_FROM { has_from = true; }
+        (
+            cf=columnFamilyName
+            | K_MUTATION_FRAGMENTS '(' cf=columnFamilyName ')' { statement_subtype = raw::select_statement::parameters::statement_subtype::MUTATION_FRAGMENTS; }
+        )
+      )?
       ( K_WHERE w=whereClause { wclause = std::move(w); } )?
       ( K_GROUP K_BY gbcolumns=listOfIdentifiers)?
       ( K_ORDER K_BY orderByClause[orderings, is_similarity_ordering] ( ',' orderByClause[orderings, is_similarity_ordering] )* )?
@@ -430,7 +433,11 @@ selectStatement returns [std::unique_ptr<raw::select_statement> expr]
       ( usingTimeoutServiceLevelClause[attrs] )?
       {
           auto params = make_lw_shared<raw::select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering, statement_subtype, bypass_cache);
-          $expr = std::make_unique<raw::select_statement>(std::move(cf), std::move(params),
+          // A disengaged table name = SELECT without FROM; the statement then
+          // runs on the system.one_row table (see raw::select_statement).
+          $expr = std::make_unique<raw::select_statement>(
+            has_from ? std::optional(std::move(cf)) : std::nullopt,
+            std::move(params),
             std::move(sclause), std::move(wclause), std::move(limit), std::move(per_partition_limit),
             std::move(gbcolumns), std::move(attrs));
       }
@@ -1259,7 +1266,7 @@ listPermissionsStatement returns [std::unique_ptr<list_permissions_statement> st
     ;
 
 permission returns [auth::permission perm = auth::permission{}]
-    : p=(K_CREATE | K_ALTER | K_DROP | K_SELECT | K_MODIFY | K_AUTHORIZE | K_DESCRIBE | K_EXECUTE | K_VECTOR_SEARCH_INDEXING)
+    : p=(K_CREATE | K_ALTER | K_DROP | K_SELECT | K_MODIFY | K_AUTHORIZE | K_DESCRIBE | K_EXECUTE | K_VECTOR_SEARCH_INDEXING | K_TEXT_SEARCH_INDEXING)
     { $perm = auth::permissions::from_string($p.text); }
     ;
 
@@ -2471,6 +2478,8 @@ K_EXECUTE:     E X E C U T E;
 K_MUTATION_FRAGMENTS:    M U T A T I O N '_' F R A G M E N T S;
 
 K_VECTOR_SEARCH_INDEXING: V E C T O R '_' S E A R C H '_' I N D E X I N G;
+
+K_TEXT_SEARCH_INDEXING: T E X T '_' S E A R C H '_' I N D E X I N G;
 
 // Case-insensitive alpha characters
 fragment A: ('a'|'A');

@@ -2211,6 +2211,10 @@ void time_window_strategy_size_tiered_behavior_correctness_fn(test_env& env) {
         auto key = partition_key::from_exploded(*s, {to_bytes("key" + to_sstring(ts))});
         auto mut = make_insert(std::move(key), ts);
         auto sst = make_sstable_containing(sst_gen, {std::move(mut)}).get();
+        // The size-tiered fallback, used for past windows, only squashes tiny sstables into the same
+        // tier if none of them were recently written. SStables composing a past window are expected
+        // to be old, as they were written before the window expired, so let's fake their write time.
+        sstables::test(sst).set_data_file_write_time(db_clock::now() - std::chrono::hours(2));
         auto bound = compaction::time_window_compaction_strategy::get_window_lower_bound(window_size, window_ts);
         buckets[bound].push_back(std::move(sst));
     };
@@ -2221,6 +2225,8 @@ void time_window_strategy_size_tiered_behavior_correctness_fn(test_env& env) {
         auto bound = compaction::time_window_compaction_strategy::get_window_lower_bound(window_size, window_ts);
         auto ret = compact_sstables(env, compaction::compaction_descriptor(std::move(buckets[bound])), cf, sst_gen).get();
         BOOST_REQUIRE(ret.new_sstables.size() == 1);
+        // Same rationale as above: the compacted sstable represents old data of a past window.
+        sstables::test(ret.new_sstables.front()).set_data_file_write_time(db_clock::now() - std::chrono::hours(2));
         buckets[bound] = std::move(ret.new_sstables);
     };
 
@@ -2710,7 +2716,6 @@ SEASTAR_TEST_CASE(sstable_cleanup_correctness_test) {
 // own sharded storage_manager, which would conflict on the same endpoints).
 static future<> run_sstable_cleanup_correctness_with_storage(data_dictionary::storage_options storage) {
     auto db_cfg = make_shared<db::config>();
-    db_cfg->experimental_features({db::experimental_features_t::feature::KEYSPACE_STORAGE_OPTIONS});
     db_cfg->object_storage_endpoints(make_storage_options_config(storage));
 
     cql_test_config cql_cfg;
@@ -2719,7 +2724,7 @@ static future<> run_sstable_cleanup_correctness_with_storage(data_dictionary::st
     return do_with_cql_env_thread([storage = std::move(storage)] (cql_test_env& e) {
         auto scf = make_sstable_compressor_factory_for_tests_in_thread();
         test_env env(test_env_config{.storage = storage}, *scf, &e.get_sstorage_manager().local());
-        auto close_env = defer([&] { env.stop().get(); });
+        auto close_env = defer([&] noexcept { env.stop().get(); });
         env.plug_mock_sstables_registry();
         sstable_cleanup_correctness_fn(e, env);
     }, std::move(cql_cfg));
@@ -3431,7 +3436,7 @@ void sstable_validate_fn(test_env& env) {
             // Corrupt the data to cause an invalid checksum.
             corrupt_sstable(sst);
 
-            auto res = sstables::validate_checksums(sst, permit).get();
+            auto res = sstables::validate_checksums_and_digests(sst, permit).get();
             BOOST_REQUIRE(res.status == validate_checksums_status::invalid);
             BOOST_REQUIRE(res.has_digest);
 
@@ -6300,6 +6305,10 @@ void test_compaction_strategy_cleanup_method_fn(test_env& env, size_t all_files 
         parallel_for_each(std::views::iota(size_t(0), all_files), [&](size_t i) -> future<> {
             auto current_step = duration_cast<microseconds>(step_base) * i;
             auto sst = co_await make_sstable_containing(sst_gen, {make_mutation(i, next_timestamp(current_step))});
+            // Cleanup operates on existing data, so the sstables are not expected to have been
+            // recently written. This is required so that tiny sstables, i.e. those smaller than
+            // min_sstable_size, are placed into the same size tier by the strategy.
+            sstables::test(sst).set_data_file_write_time(db_clock::now() - std::chrono::hours(2));
             sst->set_sstable_level(sstable_level);
             candidates[i] = std::move(sst);
         }).get();
@@ -7550,6 +7559,12 @@ static future<> test_perform_component_rewrite_single_sstable(sstables::update_s
 
         BOOST_REQUIRE(original_sst->get_sstable_level() == 0);
 
+        // Sanity: a freshly written sstable has its Scylla features set (e.g.
+        // ShadowableTombstones). The rewrite must preserve them.
+        auto original_features = original_sst->features().enabled_features;
+        BOOST_REQUIRE(original_features != 0);
+        BOOST_REQUIRE(original_sst->has_shadowable_tombstones());
+
         auto table = env.make_table_for_tests(s);
         auto close_table = deferred_stop(table);
 
@@ -7584,6 +7599,11 @@ static future<> test_perform_component_rewrite_single_sstable(sstables::update_s
 
         auto new_sst = it->second;
         BOOST_REQUIRE(new_sst->get_sstable_level() == new_level);
+        // The rewritten sstable must keep the Scylla features of the original
+        // (see the _features handling in link_with_rewritten_component /
+        // write_component_with_metadata / copy_components).
+        BOOST_REQUIRE_EQUAL(new_sst->features().enabled_features, original_features);
+        BOOST_REQUIRE(new_sst->has_shadowable_tombstones());
         BOOST_REQUIRE(new_sst->generation() != original_sst->generation());
         if (update_id) {
             BOOST_REQUIRE(new_sst->sstable_identifier() != original_sst->sstable_identifier());
@@ -7604,6 +7624,87 @@ SEASTAR_TEST_CASE(test_perform_component_rewrite_single_sstable_with_backup) {
 
 SEASTAR_TEST_CASE(test_perform_component_rewrite_single_sstable_without_backup) {
     return test_perform_component_rewrite_single_sstable(sstables::update_sstable_id::no);
+}
+
+static void object_storage_perform_component_rewrite_single_sstable_fn(test_env& env) {
+    // Regression test for SCYLLADB-3420.
+    //
+    // On object storage the component objects of an sstable are keyed by its
+    // sstable_id, and the id persisted in the Scylla component is the one used
+    // to locate them when the sstable is opened again.  Before the fix, the
+    // component rewrite copied the components under the new sstable's id but
+    // stamped the rewritten Scylla metadata with a freshly generated,
+    // unrelated id, and created no registry entry for the new sstable.  The
+    // in-memory id was right all along, so it is the persisted id and the
+    // registry entry that need to be checked here.
+    simple_schema ss;
+    auto s = ss.schema();
+    auto pk = tests::generate_partition_key(s).key();
+
+    auto mut1 = mutation(s, pk);
+    mut1.partition().apply_insert(*s, ss.make_ckey(0), ss.new_timestamp());
+    auto original_sst = make_sstable_containing(env.make_sstable(s), {std::move(mut1)}).get();
+    BOOST_REQUIRE(original_sst->sstable_identifier());
+
+    uint32_t new_level = 5;
+    auto modifier = [new_level] (sstable& sst) {
+        sst.mutate_sstable_level(new_level);
+    };
+
+    auto creator = [&env] (shared_sstable sst) {
+        return env.make_sstable(sst->get_schema());
+    };
+    auto new_sst = original_sst->link_with_rewritten_component(std::move(creator),
+            component_type::Statistics,
+            std::move(modifier),
+            sstables::update_sstable_id::yes).get();
+
+    BOOST_REQUIRE(new_sst->sstable_identifier());
+    BOOST_REQUIRE(new_sst->sstable_identifier() != original_sst->sstable_identifier());
+    BOOST_REQUIRE(new_sst->get_sstable_level() == new_level);
+    BOOST_REQUIRE(new_sst->generation() != original_sst->generation());
+    // The rewritten sstable is created fresh, so it takes its identifier from
+    // its own generation, and its component objects are keyed by it.
+    BOOST_REQUIRE(new_sst->sstable_identifier() == sstable_id(new_sst->generation().as_uuid()));
+
+    // The rewritten sstable must be registered under its own identifier,
+    // otherwise it cannot be found after restart.
+    std::optional<sstring> registered_status;
+    optimized_optional<sstable_id> registered_sid;
+    env.manager()
+        .sstables_registry()
+        .sstables_registry_list(s->id(), env.manager().get_local_host_id(),
+                                [&registered_status, &registered_sid, new_gen = new_sst->generation()]
+                                        (sstring status, sstable_state, entry_descriptor desc) {
+                                    if (desc.generation == new_gen) {
+                                        registered_status = std::move(status);
+                                        registered_sid = desc.sid;
+                                    }
+                                    return make_ready_future<>();
+                                })
+        .get();
+    BOOST_REQUIRE(registered_status);
+    BOOST_REQUIRE_EQUAL(*registered_status, "sealed");
+    BOOST_REQUIRE(registered_sid == new_sst->sstable_identifier());
+
+    // Re-open the rewritten sstable to verify that the identifier persisted in
+    // its Scylla component - the one its components are looked up by - is the
+    // identifier they were written under.  This used to be an unrelated id.
+    auto reloaded_sst = env.reusable_sst(s, new_sst).get();
+    BOOST_REQUIRE(reloaded_sst->sstable_identifier() == new_sst->sstable_identifier());
+    // The rewritten Statistics component, not the original one, is the one that
+    // was persisted under the new identifier.
+    BOOST_REQUIRE(reloaded_sst->get_sstable_level() == new_level);
+}
+
+SEASTAR_TEST_CASE(test_object_storage_perform_component_rewrite_single_sstable_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+    return test_env::do_with_async([] (test_env& env) { object_storage_perform_component_rewrite_single_sstable_fn(env); },
+            test_env_config{.storage = make_test_object_storage_options("S3")});
+}
+
+SEASTAR_FIXTURE_TEST_CASE(test_object_storage_perform_component_rewrite_single_sstable_gcs, gcs_fixture, *tests::check_run_test_decorator("ENABLE_GCP_STORAGE_TEST", true)) {
+    return test_env::do_with_async([] (test_env& env) { object_storage_perform_component_rewrite_single_sstable_fn(env); },
+            test_env_config{.storage = make_test_object_storage_options("GS")});
 }
 
 SEASTAR_TEST_CASE(test_perform_component_rewrite_multiple_sstables) {
@@ -7692,6 +7793,269 @@ SEASTAR_TEST_CASE(test_perform_component_rewrite_multiple_sstables) {
         for (auto& sst : sstables_to_keep) {
             BOOST_REQUIRE(current_sstables->contains(sst));
         }
+    });
+}
+
+// Reproducer: the last garbage-collected sstable of a *successful* compaction
+// is leaked on disk.
+//
+// When incremental compaction is active, compaction runs a second "garbage
+// collection" writer that parks its sealed output in
+// _unused_garbage_collected_sstables.  Those only ever get attached to the
+// table (and therefore only ever get deleted afterwards) inside
+// maybe_replace_exhausted_sstables_by_sst():
+//
+//     auto exhausted = std::partition(_sstables.begin(), _sstables.end(), not_exhausted);
+//     if (exhausted != _sstables.end()) {          // <-- guard
+//         ...
+//         auto unused_gc_sstables = consume_unused_garbage_collected_sstables();
+//         _new_unused_sstables.insert(...);        // <-- only path to attachment
+//
+// At end of stream mutation_compactor.hh seals the GC writer *first* and the
+// regular writer second:
+//
+//     gc_consumer.consume_end_of_stream();
+//     return consumer.consume_end_of_stream();
+//
+// so a GC sstable sealed at EOS is only consumed if the regular writer still
+// has an open sstable at that point (which drives stop_sstable_writer() ->
+// maybe_replace_exhausted_sstables_by_sst()).  If the tail of the compacted
+// stream is entirely purgeable, the regular writer has already rotated shut
+// and never reopens, so nothing consumes the final GC sstable:
+//
+//   * replace_remaining_exhausted_sstables() folds in only
+//     used_garbage_collected_sstables(), never _unused_...
+//   * delete_sstables_for_interrupted_compaction() scans only
+//     _new_partial_sstables / _new_unused_sstables, neither GC vector.
+//   * stop_gc_compaction_writer() already called consume_end_of_stream(),
+//     which seals the sstable and so clears mark_for_deletion::implicit --
+//     ~sstable() will not unlink it.
+//
+// Result: a sealed, complete sstable that is never attached, never deleted and
+// never marked, produced by a compaction that reports success.  No exception,
+// no interruption, no log line -- which is why this is invisible in production
+// until the next restart rescans the data directory.
+SEASTAR_TEST_CASE(test_last_gc_sstable_is_not_leaked_on_successful_compaction) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto builder = schema_builder(1, "tests", "gc_sstable_leak")
+                .with_column("id", utf8_type, column_kind::partition_key)
+                .with_column("value", int32_type);
+        builder.set_gc_grace_seconds(0);          // make tombstones immediately purgeable
+        auto s = builder.build();
+
+        auto cf = env.make_table_for_tests(s);
+        auto stop_cf = deferred_stop(cf);
+        auto base_sst_gen = env.make_sst_factory(s);
+
+        // Record every sstable the compaction creates.  create_gc_compaction_writer()
+        // uses the same _sstable_creator as the regular writer, so this captures the
+        // garbage-collected output too; they are told apart by get_origin().
+        std::vector<shared_sstable> created;
+        auto sst_gen = [&] {
+            auto sst = base_sst_gen();
+            created.push_back(sst);
+            return sst;
+        };
+
+        api::timestamp_type ts = 1;
+        auto key_for = [&] (int i) {
+            return partition_key::from_exploded(*s, {to_bytes(format("key{:05d}", i))});
+        };
+        // Order keys by token: the compaction stream is token-ordered, and we
+        // need the purgeable partitions to come *last*.
+        std::vector<partition_key> keys;
+        for (int i = 0; i < 24; i++) {
+            keys.push_back(key_for(i));
+        }
+        std::ranges::sort(keys, [&] (const partition_key& a, const partition_key& b) {
+            return dht::get_token(*s, a) < dht::get_token(*s, b);
+        });
+
+        auto make_live = [&] (const partition_key& k) {
+            mutation m(s, k);
+            m.set_clustered_cell(clustering_key::make_empty(), bytes("value"), data_value(int32_t(1)), ts++);
+            return m;
+        };
+        // Fully-deleted partition with an already-expired deletion time: this is
+        // what the garbage-collection writer picks up.
+        auto make_purgeable = [&] (const partition_key& k) {
+            mutation m(s, k);
+            m.partition().apply(tombstone(ts++, gc_clock::time_point(gc_clock::duration(0))));
+            return m;
+        };
+
+        // Lowest-token half is live, highest-token half is a purgeable
+        // tombstone-only tail, so the end of the stream produces GC output only.
+        // The two inputs must be *disjoint*: an sstable run is a set of
+        // non-overlapping fragments, and an overlapping pair gets re-assigned a
+        // fresh run id on insertion ("Generating a new run identifier..."),
+        // which would disable the GC writer.
+        utils::chunked_vector<mutation> live, purgeable;
+        for (size_t i = 0; i < keys.size(); i++) {
+            if (i < keys.size() / 2) {
+                live.push_back(make_live(keys[i]));
+            } else {
+                purgeable.push_back(make_purgeable(keys[i]));
+            }
+        }
+
+        auto sst1 = make_sstable_containing(base_sst_gen, std::move(live)).get();
+        auto sst2 = make_sstable_containing(base_sst_gen, std::move(purgeable)).get();
+        // Same run id on both inputs => _contains_multi_fragment_runs, which is
+        // a precondition of enable_garbage_collected_sstable_writer().
+        auto run = sstables::run_id::create_random_id();
+        sstables::test(sst1).set_run_identifier(run);
+        sstables::test(sst2).set_run_identifier(run);
+
+        column_family_test(cf).add_sstable(sst1).get();
+        column_family_test(cf).add_sstable(sst2).get();
+
+        // A real replacer, so the compaction's incremental replacements actually
+        // take effect (a no-op replacer would make every output look orphaned).
+        // Record everything the compaction ever hands over.
+        std::unordered_set<shared_sstable> handed_over;
+        auto replacer = [&] (compaction::compaction_completion_desc ccd) {
+            handed_over.insert(ccd.new_sstables.begin(), ccd.new_sstables.end());
+            handed_over.insert(ccd.old_sstables.begin(), ccd.old_sstables.end());
+            column_family_test(cf).rebuild_sstable_list(cf.as_compaction_group_view(),
+                                                        ccd.new_sstables, ccd.old_sstables).get();
+            env.test_compaction_manager().propagate_replacement(cf.as_compaction_group_view(),
+                                                                ccd.old_sstables, ccd.new_sstables);
+        };
+
+        // max_sstable_bytes = 0 forces ~one partition per output sstable (see
+        // partitions_per_sstable()), so the regular writer rotates shut after
+        // every partition and is therefore already closed once the purgeable
+        // tail of the stream is reached -- meaning its consume_end_of_stream()
+        // is a no-op and never drives maybe_replace_exhausted_sstables_by_sst().
+        compaction::compaction_descriptor desc({sst1, sst2},
+                compaction::compaction_descriptor::default_level,
+                /* max_sstable_bytes */ 0);
+        desc.enable_garbage_collection(cf->get_sstable_set());
+        auto res = compact_sstables(env, std::move(desc), cf, sst_gen, replacer,
+                                    can_purge_tombstones::yes).get();
+
+        for (auto& sst : res.new_sstables) {
+            handed_over.insert(sst);
+        }
+
+        // Sanity check: the scenario must actually have exercised the GC writer,
+        // otherwise the test proves nothing.
+        auto gc_created = std::ranges::count_if(created, [] (const shared_sstable& sst) {
+            return sst->get_origin() == "garbage_collection";
+        });
+        BOOST_REQUIRE_MESSAGE(gc_created > 0, "no garbage-collected sstable was produced; "
+                                              "test scenario did not exercise the GC writer");
+
+        // Snapshot identities before dropping references.  An sstable that was
+        // only marked for deletion is unlinked when its last reference goes away,
+        // so the test must not keep any of its own -- otherwise a correctly
+        // handled sstable would still look like a leak.
+        struct created_sst { sstring toc; sstring origin; };
+        std::vector<created_sst> created_info;
+        for (auto& sst : created) {
+            created_info.push_back({sstring(fmt::to_string(sst->toc_filename())), sstring(sst->get_origin())});
+        }
+        std::unordered_set<sstring> handed_over_tocs;
+        for (auto& sst : handed_over) {
+            handed_over_tocs.insert(sstring(fmt::to_string(sst->toc_filename())));
+        }
+        created.clear();
+        handed_over.clear();
+        res.new_sstables.clear();
+
+        // Every sstable the compaction created must either have gone through the
+        // replacer (attached, and removed again through the normal path) or have
+        // had its files removed from disk.  Anything else was written, sealed and
+        // then forgotten: it survives on disk unreferenced, and the next restart
+        // will load it.  Deletion of an unreferenced sstable runs in the
+        // background, hence the retry loop.
+        auto orphaned = [&] {
+            std::vector<sstring> extra;
+            for (const auto& info : created_info) {
+                if (handed_over_tocs.contains(info.toc)) {
+                    continue;
+                }
+                if (fs::exists(fs::path(std::string(info.toc)))) {
+                    extra.push_back(format("{} (origin: {})", info.toc, info.origin));
+                }
+            }
+            return extra;
+        };
+        (void) eventually_true([&] { return orphaned().empty(); });
+
+        auto extra = orphaned();
+        BOOST_REQUIRE_MESSAGE(extra.empty(),
+                fmt::format("compaction created sstable(s) it never attached nor deleted: [{}]",
+                            fmt::join(extra, ", ")));
+    });
+}
+
+SEASTAR_TEST_CASE(test_size_tiering_for_tiny_sstables) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto s = schema_builder(this_smp_shard_count(), "tests", "tiny_sstables")
+                .with_column("id", utf8_type, column_kind::partition_key)
+                .with_column("value", int32_type)
+                .build();
+
+        auto make_sstable = [&] (uint64_t data_size) {
+            auto sst = env.make_sstable(s, "/nowhere/in/particular", env.new_generation(), sstable_version_types::md, big);
+            auto keys = tests::generate_partition_keys(2, s, local_shard_only::yes);
+            sstables::test(sst).set_values(keys[0].key(), keys[1].key(), stats_metadata{}, data_size);
+            return sst;
+        };
+
+        constexpr uint64_t min_sstable_size = 50 * 1024 * 1024;
+        constexpr uint64_t tiny_sstable_size = 1 * 1024 * 1024;
+        constexpr uint64_t medium_sstable_size = 40 * 1024 * 1024;
+        static_assert(tiny_sstable_size < min_sstable_size && medium_sstable_size < min_sstable_size);
+
+        auto tiny_sst = make_sstable(tiny_sstable_size);
+        auto medium_sst = make_sstable(medium_sstable_size);
+
+        // Build compaction strategy options with a specific min_sstable_age, keeping all other defaults.
+        auto make_options = [] (std::chrono::seconds min_sstable_age) {
+            std::map<sstring, sstring> options = {
+                { "min_sstable_age", std::to_string(min_sstable_age.count()) },
+            };
+            return std::pair<compaction::size_tiered_compaction_strategy_options,
+                             compaction::incremental_compaction_strategy_options>(options, options);
+        };
+
+        auto expect_buckets = [&] (unsigned expected_bucket_count, db_clock::time_point write_time, std::chrono::seconds min_sstable_age) {
+            sstables::test(tiny_sst).set_data_file_write_time(write_time);
+            sstables::test(medium_sst).set_data_file_write_time(write_time);
+
+            auto [stcs_options, ics_options] = make_options(min_sstable_age);
+
+            // SSTables of 1M and 40M, both smaller than min_sstable_size (50M), must end up
+            // in the same tier only if they were not written within the last min_sstable_age.
+            // Otherwise, they must stay in distinct tiers so that similarly sized sstables are
+            // compacted together.
+            auto stcs_buckets = compaction::size_tiered_compaction_strategy::get_buckets({ tiny_sst, medium_sst }, stcs_options);
+            BOOST_REQUIRE_EQUAL(stcs_buckets.size(), expected_bucket_count);
+
+            std::vector<sstables::frozen_sstable_run> runs = {
+                make_lw_shared<const sstables::sstable_run>(sstables::sstable_run(tiny_sst)),
+                make_lw_shared<const sstables::sstable_run>(sstables::sstable_run(medium_sst)),
+            };
+            auto ics_buckets = compaction::incremental_compaction_strategy::get_buckets(runs, ics_options);
+            BOOST_REQUIRE_EQUAL(ics_buckets.size(), expected_bucket_count);
+        };
+
+        constexpr std::chrono::seconds age_1h = std::chrono::hours(1);
+        constexpr std::chrono::seconds age_10h = std::chrono::hours(10);
+        const auto now = db_clock::now();
+
+        // With the default min_sstable_age of 1h, tiny sstables written recently must stay in
+        // their own tiers, while those written more than 1h ago can be squashed into the same tier.
+        expect_buckets(2, now, age_1h);
+        expect_buckets(1, now - std::chrono::hours(2), age_1h);
+
+        // A longer min_sstable_age keeps tiny sstables in their own tiers for longer: 2h-old
+        // sstables are still "recent" under a 10h window, whereas 12h-old ones are squashed.
+        expect_buckets(2, now - std::chrono::hours(2), age_10h);
+        expect_buckets(1, now - std::chrono::hours(12), age_10h);
     });
 }
 

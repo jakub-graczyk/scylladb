@@ -89,7 +89,6 @@ namespace {
     const auto set_use_schema_commitlog = schema_builder::register_schema_initializer([](schema_builder& builder) {
         static const std::unordered_set<sstring> tables = {
             schema_tables::SCYLLA_TABLE_SCHEMA_HISTORY,
-            system_keyspace::BROADCAST_KV_STORE,
             system_keyspace::RAFT,
             system_keyspace::RAFT_SNAPSHOTS,
             system_keyspace::RAFT_SNAPSHOT_CONFIG,
@@ -317,6 +316,7 @@ schema_ptr system_keyspace::topology_requests() {
         return schema_builder(this_smp_shard_count(), NAME, TOPOLOGY_REQUESTS, std::optional(id))
             .with_column("id", timeuuid_type, column_kind::partition_key)
             .with_column("initiating_host", uuid_type)
+            .with_column("target_host", uuid_type)
             .with_column("request_type", utf8_type)
             .with_column("start_time", timestamp_type)
             .with_column("done", boolean_type)
@@ -1129,18 +1129,6 @@ schema_ptr system_keyspace::discovery() {
             // May be unknown during discovery, then it's set to UUID 0.
             .with_column("raft_server_id", uuid_type)
             .set_comment("State of cluster discovery algorithm: the set of discovered peers")
-            .with_hash_version()
-            .build();
-    }();
-    return schema;
-}
-
-schema_ptr system_keyspace::broadcast_kv_store() {
-    static thread_local auto schema = [] {
-        auto id = generate_legacy_id(NAME, BROADCAST_KV_STORE);
-        return schema_builder(this_smp_shard_count(), NAME, BROADCAST_KV_STORE, id)
-            .with_column("key", utf8_type, column_kind::partition_key)
-            .with_column("value", utf8_type)
             .with_hash_version()
             .build();
     }();
@@ -2276,15 +2264,9 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
                     dicts(), view_building_tasks(), client_routes(), cdc_streams_state(), cdc_streams_history()
     });
 
-    if (cfg.check_experimental(db::experimental_features_t::feature::BROADCAST_TABLES)) {
-        r.insert(r.end(), {broadcast_kv_store()});
-    }
-
     r.insert(r.end(), {tablets()});
 
-    if (cfg.check_experimental(db::experimental_features_t::feature::KEYSPACE_STORAGE_OPTIONS)) {
-        r.insert(r.end(), {sstables_registry()});
-    }
+    r.insert(r.end(), {sstables_registry()});
 
     if (cfg.check_experimental(db::experimental_features_t::feature::STRONGLY_CONSISTENT_TABLES)) {
         r.insert(r.end(), {raft_groups(), raft_groups_snapshots(), raft_groups_snapshot_config()});
@@ -3589,6 +3571,9 @@ system_keyspace::topology_requests_entry system_keyspace::topology_request_row_t
     entry.id = id;
     if (row.has("initiating_host")) {
         entry.initiating_host = row.get_as<utils::UUID>("initiating_host");
+    }
+    if (row.has("target_host")) {
+        entry.target_host = row.get_as<utils::UUID>("target_host");
     }
     if (row.has("request_type")) {
         auto rts = row.get_as<sstring>("request_type");

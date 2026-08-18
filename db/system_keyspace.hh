@@ -198,7 +198,6 @@ public:
     static constexpr auto REPAIR_TASKS = "repair_tasks";
     static constexpr auto GROUP0_HISTORY = "group0_history";
     static constexpr auto DISCOVERY = "discovery";
-    static constexpr auto BROADCAST_KV_STORE = "broadcast_kv_store";
     static constexpr auto TOPOLOGY = "topology";
     static constexpr auto TOPOLOGY_REQUESTS = "topology_requests";
     static constexpr auto SSTABLES_REGISTRY = "sstables";
@@ -212,6 +211,7 @@ public:
     static constexpr auto VIEW_BUILDING_TASKS = "view_building_tasks";
     static constexpr auto CLIENT_ROUTES = "client_routes";
     static constexpr auto VERSIONS = "versions";
+    static constexpr auto ONE_ROW = "one_row";
     static constexpr auto BATCHES = "batches";
     static constexpr auto AVAILABLE_RANGES = "available_ranges";
     static constexpr auto VIEWS_BUILDS_IN_PROGRESS = "views_builds_in_progress";
@@ -254,7 +254,6 @@ public:
     static schema_ptr repair_tasks();
     static schema_ptr group0_history();
     static schema_ptr discovery();
-    static schema_ptr broadcast_kv_store();
     static schema_ptr topology();
     static schema_ptr topology_requests();
     static schema_ptr sstables_registry();
@@ -412,6 +411,7 @@ public:
     struct topology_requests_entry {
         utils::UUID id;
         utils::UUID initiating_host;
+        std::optional<utils::UUID> target_host;
         std::variant<std::monostate, service::topology_request, service::global_topology_request> request_type;
         db_clock::time_point start_time;
         bool done;

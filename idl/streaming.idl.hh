@@ -62,6 +62,7 @@ enum class stream_reason : uint8_t {
     rebuild,
     repair,
     replace,
+    restore,
 };
 
 enum class stream_mutation_fragments_cmd : uint8_t {
@@ -111,7 +112,7 @@ class stream_blob_meta {
     streaming::file_ops fops;
     service::frozen_topology_guard topo_guard;
     std::optional<sstables::sstable_state> sstable_state;
-    std::optional<streaming::stream_sstable_meta> sstable_meta;
+    std::optional<streaming::stream_sstable_meta> sstable_meta [[version 2026.3]];
 };
 
 class node_and_shard {

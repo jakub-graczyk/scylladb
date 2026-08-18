@@ -11,6 +11,7 @@
 #include "api/api-doc/column_family.json.hh"
 #include "api/api-doc/storage_service.json.hh"
 #include "api/api-doc/storage_proxy.json.hh"
+#include "api/api-doc/tasks.json.hh"
 #include "api/scrub_status.hh"
 #include "db/config.hh"
 #include "db/schema_tables.hh"
@@ -37,6 +38,7 @@
 #include "gms/feature_service.hh"
 #include "gms/gossiper.hh"
 #include "db/system_keyspace.hh"
+#include "db/snapshot_types.hh"
 #include <seastar/http/exception.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/closeable.hh>
@@ -77,6 +79,7 @@ namespace api {
 
 namespace ss = httpd::storage_service_json;
 namespace sp = httpd::storage_proxy_json;
+namespace t = httpd::tasks_json;
 namespace cf = httpd::column_family_json;
 using namespace json;
 
@@ -235,7 +238,7 @@ scrub_info parse_scrub_options(const http_context& ctx, std::unique_ptr<http::re
     info.keyspace = std::move(keyspace);
     info.column_families = table_infos | std::views::transform(&table_info::name) | std::ranges::to<std::vector>();
     auto scrub_mode_str = req->get_query_param("scrub_mode");
-    auto scrub_mode = compaction::compaction_type_options::scrub::mode::abort;
+    auto scrub_mode = compaction::compaction_type_options::scrub::mode::validate;
 
     if (scrub_mode_str.empty()) {
         const auto skip_corrupted = validate_bool_x(req->get_query_param("skip_corrupted"), false);
@@ -799,6 +802,27 @@ rest_cleanup_all(http_context& ctx, sharded<service::storage_service>& ss, std::
         });
 
         co_return json::json_return_type(0);
+}
+
+static future<shared_ptr<compaction::cleanup_keyspace_compaction_task_impl>> force_keyspace_cleanup(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto& db = ctx.db;
+        auto [keyspace, table_infos] = parse_table_infos(ctx, *req);
+        const auto& rs = db.local().find_keyspace(keyspace).get_replication_strategy();
+        if (rs.is_local() || !rs.is_vnode_based()) {
+            auto reason = rs.is_local() ? "require" : "support";
+            apilog.info("Keyspace {} does not {} cleanup", keyspace, reason);
+            co_return nullptr;
+        }
+        apilog.info("force_keyspace_cleanup: keyspace={} tables={}", keyspace, table_infos);
+        if (!co_await ss.local().is_vnodes_cleanup_allowed(keyspace)) {
+            auto msg = "Can not perform cleanup operation when topology changes";
+            apilog.warn("force_keyspace_cleanup: keyspace={} tables={}: {}", keyspace, table_infos, msg);
+            co_await coroutine::return_exception(std::runtime_error(msg));
+        }
+
+        auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
+        co_return co_await compaction_module.make_and_start_task<compaction::cleanup_keyspace_compaction_task_impl>(
+            {}, std::move(keyspace), db, table_infos, compaction::flush_mode::all_tables, tasks::is_user_task::yes);
 }
 
 static
@@ -2043,6 +2067,21 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
     ss::cdc_streams_check_and_repair.set(r, gated(ss, rest_bind(rest_cdc_streams_check_and_repair, ss)));
     ss::cleanup_all.set(r, gated(ss, rest_bind(rest_cleanup_all, ctx, ss)));
     ss::reset_cleanup_needed.set(r, gated(ss, rest_bind(rest_reset_cleanup_needed, ctx, ss)));
+    t::force_keyspace_cleanup_async.set(r, [&ctx, &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        tasks::task_id id = tasks::task_id::create_null_id();
+        auto task = co_await force_keyspace_cleanup(ctx, ss, std::move(req));
+        if (task) {
+            id = task->get_status().id;
+        }
+        co_return json::json_return_type(id.to_sstring());
+    });
+    ss::force_keyspace_cleanup.set(r, [&ctx, &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto task = co_await force_keyspace_cleanup(ctx, ss, std::move(req));
+        if (task) {
+            co_await task->done();
+        }
+        co_return json::json_return_type(0);
+    });
     ss::force_flush.set(r, gated(ss, rest_bind(rest_force_flush, ctx)));
     ss::force_keyspace_flush.set(r, gated(ss, rest_bind(rest_force_keyspace_flush, ctx)));
     ss::decommission.set(r, gated(ss, rest_bind(rest_decommission, ss, ssc)));
@@ -2129,6 +2168,8 @@ void unset_storage_service(http_context& ctx, routes& r) {
     ss::cdc_streams_check_and_repair.unset(r);
     ss::cleanup_all.unset(r);
     ss::reset_cleanup_needed.unset(r);
+    t::force_keyspace_cleanup_async.unset(r);
+    ss::force_keyspace_cleanup.unset(r);
     ss::force_flush.unset(r);
     ss::force_keyspace_flush.unset(r);
     ss::logstor_compaction.unset(r);
@@ -2383,6 +2424,46 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
 
         auto& ctl = snap_ctl.local();
         auto task_id = co_await ctl.start_backup(std::move(endpoint), std::move(bucket), std::move(prefix), std::move(keyspace), std::move(table), std::move(snapshot_name), move_files);
+        co_return json::json_return_type(fmt::to_string(task_id));
+    });
+
+    ss::start_global_backup.set(r, [&snap_ctl] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto column_families = split(req->get_query_param("table"), ",");
+        std::vector<sstring> keynames = split(req->get_query_param("keyspace"), ",");
+        auto snapshot_name = req->get_query_param("snapshot");
+        auto move_files = req_param<bool>(*req, "move_files", false);
+
+        rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
+        rjson::value parsed = rjson::parse(std::move(content));
+        if (!parsed.IsArray()) {
+            throw httpd::bad_param_exception("backup locations (in body) must be a JSON array");
+        }
+
+        std::unordered_map<sstring, db::snapshot_dc_location> dclocs;
+
+        const auto& locations = parsed.GetArray();
+        for (auto& location : locations) {
+            if (!location.IsObject()) {
+                throw httpd::bad_param_exception("backup location (in body) must be a JSON object");
+            }
+            if (location.HasMember("manifests")) {
+                throw httpd::bad_param_exception("backup location 'manifests' must not be set for backup");
+            }
+
+            auto endpoint = rjson::to_string(location["endpoint"]);
+            auto bucket = rjson::to_string(location["bucket"]);
+            auto prefix = rjson::to_string(location["prefix"]);
+            auto dc = rjson::to_string(location["datacenter"]);
+
+            dclocs[dc] = db::snapshot_dc_location {
+                .endpoint = endpoint,
+                .bucket = bucket,
+                .prefix = prefix,
+            };
+        }
+
+        auto& ctl = snap_ctl.local();
+        auto task_id = co_await ctl.start_global_backup(std::move(dclocs), std::move(keynames), std::move(column_families), std::move(snapshot_name), move_files);
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 
