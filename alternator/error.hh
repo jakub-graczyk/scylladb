@@ -91,6 +91,11 @@ public:
     static api_error table_not_found(std::string msg) {
         return api_error("TableNotFoundException", std::move(msg));
     }
+    // DynamoDB's documented error for reusing a ClientToken with different
+    // parameters inside the idempotency window.
+    static api_error idempotent_parameter_mismatch(std::string msg) {
+        return api_error("IdempotentParameterMismatch", std::move(msg));
+    }
     static api_error limit_exceeded(std::string msg) {
         return api_error("LimitExceededException", std::move(msg));
     }
