@@ -1544,9 +1544,10 @@ struct create_table_params {
     std::string table_name;
     std::map<sstring, sstring> tags_map;
     const rjson::value* vector_indexes; // This stays valid as long as the caller didn't drop the request.
+    bool stream_enabled;
 };
 
-create_table_params validate_create_table_request(const rjson::value& request, bool composite_gsi_keys_supported) {
+create_table_params validate_create_table_request(const rjson::value& request, const gms::feature_service& feat, const db::tablets_mode_t::mode tablets_mode) {
 
     // We begin by parsing and validating the content of the CreateTable
     // command. We can't inspect the current database schema at this point
@@ -1656,7 +1657,7 @@ create_table_params validate_create_table_request(const rjson::value& request, b
         if (!gsi->IsArray()) {
             throw api_error::validation("GlobalSecondaryIndexes must be an array.");
         }
-        // const bool composite_gsi_keys_supported = _proxy.features().alternator_composite_gsi_keys;
+        const bool composite_gsi_keys_supported = feat.alternator_composite_gsi_keys;
         for (const rjson::value& g : gsi->GetArray()) {
             const rjson::value* index_name_v = rjson::find(g, "IndexName");
             if (!index_name_v || !index_name_v->IsString()) {
@@ -1822,33 +1823,6 @@ create_table_params validate_create_table_request(const rjson::value& request, b
     set_table_creation_time(tags_map, db_clock::now());
     builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
 
-    return {
-        std::move(builder),
-        std::move(view_builders),
-        std::move(index_names),
-        std::move(keyspace_name),
-        std::move(table_name),
-        std::move(tags_map),
-        vector_indexes,
-    };
-}
-
-future<executor::request_return_type> executor::create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization, bool warn_authorization,
-            const db::tablets_mode_t::mode tablets_mode, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
-    throwing_assert(this_shard_id() == 0);
-
-    co_await verify_create_permission(enforce_authorization, warn_authorization, client_state, _stats);
-
-    const bool composite_gsi_keys_supported = _proxy.features().alternator_composite_gsi_keys;
-    create_table_params validated = validate_create_table_request(request, composite_gsi_keys_supported);
-    auto builder = validated.builder;
-    auto view_builders = validated.view_builders;
-    auto index_names = validated.index_names;
-    auto keyspace_name = validated.keyspace_name;
-    auto tags_map = validated.tags_map;
-    auto table_name = validated.table_name;
-    auto vector_indexes = validated.vector_indexes;
-
     const rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
     bool stream_enabled = false;
     if (stream_specification && stream_specification->IsObject()) {
@@ -1859,16 +1833,47 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
     }
 
     if (stream_enabled) {
-        const bool uses_tablets = get_initial_tablet_count(tags_map, _proxy.features(), tablets_mode).has_value();
+        const bool uses_tablets = get_initial_tablet_count(tags_map, feat, tablets_mode).has_value();
         if (uses_tablets) {
-            if (!_proxy.features().cdc_block_tablet_merges_for_alternator_streams) {
-                co_return api_error::validation(
+            if (!feat.cdc_block_tablet_merges_for_alternator_streams) {
+                throw api_error::validation(
                         "Alternator Streams on tablet tables are not supported until all nodes in the cluster "
                         "support blocking tablet merges for Alternator Streams");
             }
             block_tablet_merges_for_alternator_streams(builder, /*defer_enablement=*/false);
         }
     }
+
+    return {
+        std::move(builder),
+        std::move(view_builders),
+        std::move(index_names),
+        std::move(keyspace_name),
+        std::move(table_name),
+        std::move(tags_map),
+        vector_indexes,
+        stream_enabled,
+    };
+}
+
+future<executor::request_return_type> executor::create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization, bool warn_authorization,
+            const db::tablets_mode_t::mode tablets_mode, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
+    throwing_assert(this_shard_id() == 0);
+
+    co_await verify_create_permission(enforce_authorization, warn_authorization, client_state, _stats);
+
+    const bool composite_gsi_keys_supported = _proxy.features().alternator_composite_gsi_keys;
+    create_table_params validated = validate_create_table_request(request, composite_gsi_keys_supported, tablets_mode);
+    auto builder = validated.builder;
+    auto view_builders = validated.view_builders;
+    auto index_names = validated.index_names;
+    auto keyspace_name = validated.keyspace_name;
+    auto tags_map = validated.tags_map;
+    auto table_name = validated.table_name;
+    auto vector_indexes = validated.vector_indexes;
+    auto stream_enabled = validated.stream_enabled;
+
+
 
     schema_ptr schema = builder.build();
     for (auto& view_builder : view_builders) {
