@@ -71,6 +71,7 @@ std::pair<std::string, std::string> get_valid_bucket_and_prefix(const rjson::val
 
 future<executor::request_return_type> executor::import_table(service::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
     _stats.api_operations.import_table++;
+    // NOTE: there is access to _proxy here it's executors field.
 
     // Optional parameter. Present-but-empty is rejected by the getter itself.
     auto client_token = get_non_empty_string_attribute(request, "ClientToken");
