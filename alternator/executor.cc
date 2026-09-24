@@ -1852,7 +1852,7 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
     const rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
     bool stream_enabled = false;
     if (stream_specification && stream_specification->IsObject()) {
-        if (executor::add_stream_options(*stream_specification, builder, _proxy)) {
+        if (executor::add_stream_options(*stream_specification, builder)) {
             stream_enabled = true;
             validate_cdc_log_name_length(builder.cf_name());
         }
@@ -2100,7 +2100,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
             rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
             if (stream_specification && stream_specification->IsObject()) {
                 empty_request = false;
-                if (add_stream_options(*stream_specification, builder, p.local(), tab->cdc_options())) {
+                if (add_stream_options(*stream_specification, builder, tab->cdc_options())) {
                     validate_cdc_log_name_length(builder.cf_name());
                     bool uses_tablets = p.local().local_db().find_keyspace(tab->ks_name()).get_replication_strategy().uses_tablets();
                     if (uses_tablets) {
