@@ -222,6 +222,9 @@ public:
 
 create_table_params validate_create_table_request(const rjson::value& request, const gms::feature_service& feat, const db::tablets_mode_t::mode tablets_mode);
 
+// The ARN of a table, also for one which is not created yet.
+rjson::value generate_arn_for_table(std::string_view keyspace_name, std::string_view table_name);
+
 // returns table creation time in seconds since epoch for `db_clock`
 double get_table_creation_time(const schema &schema);
 
