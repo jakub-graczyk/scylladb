@@ -1536,17 +1536,6 @@ static std::map<sstring, sstring> make_gsi_tags(
     return tags;
 }
 
-struct create_table_params {
-    schema_builder builder;
-    std::vector<schema_builder> view_builders;
-    std::unordered_set<std::string> index_names;
-    std::string keyspace_name;
-    std::string table_name;
-    std::map<sstring, sstring> tags_map;
-    const rjson::value* vector_indexes; // This stays valid as long as the caller didn't drop the request.
-    bool stream_enabled;
-};
-
 create_table_params validate_create_table_request(const rjson::value& request, const gms::feature_service& feat, const db::tablets_mode_t::mode tablets_mode) {
 
     // We begin by parsing and validating the content of the CreateTable
@@ -1852,28 +1841,23 @@ create_table_params validate_create_table_request(const rjson::value& request, c
         std::move(table_name),
         std::move(tags_map),
         vector_indexes,
-        stream_enabled,
     };
 }
 
-future<executor::request_return_type> executor::create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization, bool warn_authorization,
-            const db::tablets_mode_t::mode tablets_mode, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
-    throwing_assert(this_shard_id() == 0);
-
-    co_await verify_create_permission(enforce_authorization, warn_authorization, client_state, _stats);
-
-    const bool composite_gsi_keys_supported = _proxy.features().alternator_composite_gsi_keys;
-    create_table_params validated = validate_create_table_request(request, composite_gsi_keys_supported, tablets_mode);
+future<executor::request_return_type> executor::commit_table_creation(
+    rjson::value&& request,
+    create_table_params&& validated,
+    service::client_state&& client_state,
+    const db::tablets_mode_t::mode tablets_mode)
+{
+    // FIXME: use std::move();
     auto builder = validated.builder;
     auto view_builders = validated.view_builders;
     auto index_names = validated.index_names;
     auto keyspace_name = validated.keyspace_name;
     auto tags_map = validated.tags_map;
     auto table_name = validated.table_name;
-    auto vector_indexes = validated.vector_indexes;
-    auto stream_enabled = validated.stream_enabled;
-
-
+    auto vector_indexes = validated.vector_indexes; // valid, pointer to `request`.
 
     schema_ptr schema = builder.build();
     for (auto& view_builder : view_builders) {
@@ -1995,6 +1979,18 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
     executor::supplement_table_info(request, *schema, _proxy);
     rjson::add(status, "TableDescription", std::move(request));
     co_return rjson::print(std::move(status));
+}
+
+future<executor::request_return_type> executor::create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization, bool warn_authorization,
+            const db::tablets_mode_t::mode tablets_mode, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
+    throwing_assert(this_shard_id() == 0);
+
+    co_await verify_create_permission(enforce_authorization, warn_authorization, client_state, _stats);
+
+    create_table_params validated = validate_create_table_request(request, _proxy.features(), tablets_mode);
+
+    co_return co_await commit_table_creation(std::move(request), std::move(validated), std::move(client_state), tablets_mode);
+
 }
 
 future<executor::request_return_type> executor::create_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {

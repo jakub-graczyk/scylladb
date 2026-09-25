@@ -17,6 +17,7 @@
 #include "alternator/executor_util.hh"
 #include "audit/audit.hh"
 #include "service/client_state.hh"
+#include "service/storage_proxy.hh"
 #include "service_permit.hh"
 #include "tracing/trace_state.hh"
 #include "utils/rjson.hh"
@@ -73,16 +74,18 @@ future<executor::request_return_type> executor::import_table(service::client_sta
     _stats.api_operations.import_table++;
     // NOTE: there is access to _proxy here it's executors field.
 
+    // validate -> throw
+    // consult token -> return already running desc
+    // build import desc
+    // commit to system distributed table
+    // start import internal job
+    // return import desc
+
     // Optional parameter. Present-but-empty is rejected by the getter itself.
     auto client_token = get_non_empty_string_attribute(request, "ClientToken");
     if (!is_valid_client_token(client_token)) {
         co_return api_error::validation(
-                "ClientToken attribute: value does not match the required pattern ^[^\\$]+$");
-    }
-
-    auto import_description = co_await in_progress_import_description(client_token, request);
-    if (import_description) {
-        co_return *import_description;
+                "ClientToken attribute: value does not match the required pattern ^[^$]+$");
     }
 
     auto input_format = get_non_empty_string_attribute(request, "InputFormat");
@@ -113,8 +116,23 @@ future<executor::request_return_type> executor::import_table(service::client_sta
         }
     }
 
+    auto table_creation_params = rjson::find(request, "TableCreationParameters");
+    if (table_creation_params) {
+        auto import_request_copy = rjson::copy(request);
+        rjson::remove_member(import_request_copy, "")
+        auto validated_params =  validate_create_table_request(request, _proxy.features(), _proxy.data_dictionary().get_config().tablets_mode_for_new_keyspaces());
 
-    auto req_return = create_table(client_state, trace_state, permit, rjson::copy(request), audit_info);
+    }
+
+
+    auto import_description = co_await in_progress_import_description(client_token, request);
+    if (import_description) {
+        co_return *import_description;
+    }
+
+    // check if table exists and reject table creation parameters if it does.
+    // only after existing import desc return and only after table creation parameters validated
+    // -> this makes the request idempotent.
 
     rjson::value response = rjson::empty_object();
     co_return rjson::print(std::move(response));

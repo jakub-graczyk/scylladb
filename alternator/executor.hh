@@ -10,6 +10,7 @@
 
 #include <seastar/core/future.hh>
 #include "audit/audit.hh"
+#include "schema/schema_builder.hh"
 #include "seastarx.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -83,6 +84,16 @@ class put_or_delete_item;
 namespace parsed {
 class expression_cache;
 }
+
+struct create_table_params {
+    schema_builder builder;
+    std::vector<schema_builder> view_builders;
+    std::unordered_set<std::string> index_names;
+    std::string keyspace_name;
+    std::string table_name;
+    std::map<sstring, sstring> tags_map;
+    const rjson::value* vector_indexes; // This stays valid as long as the caller didn't drop the request.
+};
 
 class executor : public peering_sharded_service<executor> {
     gms::gossiper& _gossiper;
@@ -189,6 +200,7 @@ private:
                      std::optional<audit::audit_table_set> alternator_batch_tables = std::nullopt);
 
     future<std::variant<rjson::value, api_error>> fill_table_description(schema_ptr schema, table_status tbl_status, service::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit);
+    future<executor::request_return_type> commit_table_creation(rjson::value&& request, create_table_params&& validated, service::client_state&& client_state, const db::tablets_mode_t::mode tablets_mode);
     future<executor::request_return_type> create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, bool enforce_authorization,
             bool warn_authorization, const db::tablets_mode_t::mode tablets_mode, std::unique_ptr<audit::audit_info_alternator>& audit_info);
 
@@ -207,6 +219,8 @@ public:
     static void supplement_table_info(rjson::value& descr, const schema& schema, service::storage_proxy& sp);
     static void supplement_table_stream_info(rjson::value& descr, const schema& schema, const service::storage_proxy& sp);
 };
+
+create_table_params validate_create_table_request(const rjson::value& request, const gms::feature_service& feat, const db::tablets_mode_t::mode tablets_mode);
 
 // returns table creation time in seconds since epoch for `db_clock`
 double get_table_creation_time(const schema &schema);
